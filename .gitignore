@@ -1,0 +1,54 @@
+# Python caches and environments
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+.env
+
+# Notebook artifacts
+.ipynb_checkpoints/
+
+# Build and package artifacts
+build/
+dist/
+*.egg-info/
+
+# Runtime logs and outputs
+outputs/
+d3rlpy_logs/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local datasets and large files
+# Keep lightweight docs in data/, but ignore raw data payloads by default.
+data/*
+!data/.gitkeep
+!data/README.md
+
+# Public demo dataset is allowed for reproducible examples.
+!data/mimic-iv-clinical-database-demo-on-fhir-2.0/
+!data/mimic-iv-clinical-database-demo-on-fhir-2.0/**
+
+# Keep any non-demo MIMIC exports private/offline.
+data/mimic-iv-clinical-database-*/
+!data/mimic-iv-clinical-database-demo-on-fhir-2.0/
+!data/mimic-iv-clinical-database-demo-on-fhir-2.0/**
+data/mimic-iv-*/
+data/private*/
+
+# LaTeX auxiliary files
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+
+# Optional: ignore generated PDF reports if desired
+# *.pdf

@@ -1,0 +1,15 @@
+seed: 42
+mock_data:
+  n_episodes: 500
+  min_horizon: 8
+  max_horizon: 24
+  state_dim: 16
+  n_actions: 25
+  reward_scale: 1.0
+training:
+  device: cpu
+  n_steps: 1000
+  batch_size: 256
+  eval_interval: 100
+cql_sweep:
+  alpha_values: [0.1, 0.5, 1.0, 5.0]

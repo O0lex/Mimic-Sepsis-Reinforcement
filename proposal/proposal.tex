@@ -1,0 +1,37 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=0.75in]{geometry}
+\usepackage{cite}
+\usepackage{hyperref}
+\usepackage{enumitem} % Added for list spacing control
+
+\title{\vspace{-1cm}Project Proposal: Optimizing Sepsis Treatment via Offline Reinforcement Learning and Conservative Policy Evaluation}
+\author{Alex Groiser, Yusuf Hamza}
+\date{March 19, 2026}
+
+\begin{document}
+
+\maketitle
+\vspace{-0.5cm}
+
+\section*{Background and Motivation}
+Sepsis is one of the main causes of ICU mortality, which makes accurate titration of intravenous fluids and vasopressors very necessary. Clinical decision-making usually relies on established experimentation that might not fully account for long-term physiological rewards or complex patient state transitions. Offline RL can find optimal policies from historical electronic health records without the safety risks of real-time exploration with online methods. So this project aims to develop an agent capable of identifying treatment strategies that improve patient survival rates compared to historical physician behavior, and be an example of reliable deployment of AI in critical care medicine.
+
+\section*{Methods}
+From the MIMIC-IV dataset, we will extract a specific cohort of patients meeting the sepsis criteria for analysis, and we will treat their vital signs and treatments as an MDP where the goal is to maximize long-term survival. Since we cannot experiment on live patients (and part of the study is to check offline capabilities), we will use Conservative Q-learning to add a penalty to actions the model has not seen before, which prevents optimism that many offline agents experience. We will benchmark our results against simple Behavior Cloning and actual doctor decisions using Weighted Importance Sampling to estimate how many lives our policy would have saved. If time allows, we want to test Diffusion-based policies or a trajectory guard that can intervene when a dangerous physiological state is predicted. We will implement this in PyTorch using the d3rlpy library and validate with hyperparameter sweeps.
+
+\section*{References}
+\begin{itemize}[itemsep=10pt, parsep=2pt, topsep=4pt]
+    \item Wu, X., et al. (2023). \textit{A value-based deep reinforcement learning model with human expertise in optimal treatment of sepsis}. npj Digital Medicine.
+    \item Kumar, A., et al. (2020). \textit{Conservative Q-Learning for Offline Reinforcement Learning}. arXiv:2006.04779.
+    \item Johnson, A. E. W., et al. (2023). \textit{MIMIC-IV, a freely accessible electronic health record dataset}. Scientific Data.
+    \item Levine, S., et al. (2020). \textit{Offline Reinforcement Learning: Tutorial, Review, and Perspectives on Open Problems}. arXiv:2005.01643.
+    \item Wang, Z., et al. (2023). \textit{Diffusion Policies as an Expressive Representation for Offline RL}. ICLR.
+\end{itemize}
+
+\end{document}
+
+
+
+
+
