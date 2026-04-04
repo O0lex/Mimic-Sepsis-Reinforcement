@@ -59,6 +59,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--clip", type=float, default=20.0)
     parser.add_argument("--n-boot", type=int, default=200)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--eval-split", type=str, default="test")
     return parser.parse_args()
 
 
@@ -72,6 +73,13 @@ def main() -> None:
     missing = required_cols - set(df.columns)
     if missing:
         raise ValueError(f"Missing required columns: {sorted(missing)}")
+
+    split_used = "all"
+    if "split" in df.columns and args.eval_split:
+        df_split = df[df["split"].astype(str) == args.eval_split].copy()
+        if not df_split.empty:
+            df = df_split
+            split_used = args.eval_split
 
     behavior_return = float(df.groupby("episode_id", sort=False)["reward"].sum().mean())
 
@@ -88,6 +96,9 @@ def main() -> None:
         "cql_wis_ci95": [cql_lo, cql_hi],
         "clip": args.clip,
         "n_boot": args.n_boot,
+        "eval_split": split_used,
+        "n_transitions_eval": int(df.shape[0]),
+        "n_episodes_eval": int(df["episode_id"].nunique()),
         "input_csv": str(args.in_csv),
     }
 

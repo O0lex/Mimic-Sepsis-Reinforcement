@@ -56,6 +56,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--action-bins", type=int, default=5)
     parser.add_argument("--max-hours", type=int, default=48)
     parser.add_argument("--max-observations", type=int, default=0)
+    parser.add_argument("--train-frac", type=float, default=0.7)
+    parser.add_argument("--val-frac", type=float, default=0.15)
     return parser.parse_args()
 
 
@@ -317,6 +319,8 @@ def _build_arrays(
     action_bins: int,
     max_hours: int,
     seed: int,
+    train_frac: float,
+    val_frac: float,
 ) -> dict[str, np.ndarray]:
     set_seed(seed)
 
@@ -349,6 +353,7 @@ def _build_arrays(
     terminals = []
     episode_terminals = []
     episode_ids = []
+    patient_ids = []
 
     for ep_idx, (eid, enc) in enumerate(cohort.items()):
         total_hours = max(1, int(np.ceil((enc.end - enc.start).total_seconds() / 3600.0)))
@@ -395,6 +400,7 @@ def _build_arrays(
             terminals.append(done)
             episode_terminals.append(done)
             episode_ids.append(ep_idx)
+            patient_ids.append(enc.patient_id)
 
     observations_np = np.asarray(observations, dtype=np.float32)
     actions_np = np.asarray(actions, dtype=np.int64)
@@ -402,9 +408,34 @@ def _build_arrays(
     terminals_np = np.asarray(terminals, dtype=np.float32)
     episode_terminals_np = np.asarray(episode_terminals, dtype=np.float32)
     episode_ids_np = np.asarray(episode_ids, dtype=np.int64)
+    patient_ids_np = np.asarray(patient_ids)
+
+    unique_patients = np.unique(patient_ids_np)
+    rng = np.random.default_rng(seed)
+    shuffled = rng.permutation(unique_patients)
+
+    n_train = int(np.floor(train_frac * shuffled.shape[0]))
+    n_val = int(np.floor(val_frac * shuffled.shape[0]))
+    n_train = max(1, min(n_train, shuffled.shape[0]))
+    n_val = max(0, min(n_val, shuffled.shape[0] - n_train))
+
+    train_patients = set(shuffled[:n_train].tolist())
+    val_patients = set(shuffled[n_train : n_train + n_val].tolist())
+
+    split_np = np.empty(patient_ids_np.shape[0], dtype="<U8")
+    for i, pid in enumerate(patient_ids_np):
+        if pid in train_patients:
+            split_np[i] = "train"
+        elif pid in val_patients:
+            split_np[i] = "val"
+        else:
+            split_np[i] = "test"
 
     n_actions = int(actions_np.max() + 1) if actions_np.size else action_bins * action_bins
-    counts = np.bincount(actions_np, minlength=n_actions).astype(np.float64)
+    train_mask = split_np == "train"
+    train_actions = actions_np[train_mask]
+    laplace = 1.0
+    counts = np.bincount(train_actions, minlength=n_actions).astype(np.float64) + laplace
     probs = counts / np.clip(counts.sum(), 1.0, None)
     mu = probs[np.clip(actions_np, 0, n_actions - 1)]
 
@@ -419,6 +450,8 @@ def _build_arrays(
         "terminals": terminals_np,
         "episode_terminals": episode_terminals_np,
         "episode_ids": episode_ids_np,
+        "patient_ids": patient_ids_np,
+        "split": split_np,
         "behavior_probs": np.asarray(mu, dtype=np.float32),
         "bc_probs": np.asarray(bc_probs, dtype=np.float32),
         "cql_probs": np.asarray(cql_probs, dtype=np.float32),
@@ -473,6 +506,8 @@ def main() -> None:
         action_bins=args.action_bins,
         max_hours=args.max_hours,
         seed=args.seed,
+        train_frac=args.train_frac,
+        val_frac=args.val_frac,
     )
 
     args.out_npz.parent.mkdir(parents=True, exist_ok=True)
@@ -485,6 +520,8 @@ def main() -> None:
             "mu_prob": arrays["behavior_probs"],
             "bc_prob": arrays["bc_probs"],
             "cql_prob": arrays["cql_probs"],
+            "patient_id": arrays["patient_ids"],
+            "split": arrays["split"],
         }
     )
     args.out_ope_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -498,6 +535,11 @@ def main() -> None:
         "state_dim": int(arrays["observations"].shape[1]),
         "observed_actions": int(np.unique(arrays["actions"]).shape[0]),
         "mean_reward": float(np.mean(arrays["rewards"])),
+        "split_counts": {
+            "train": int(np.sum(arrays["split"] == "train")),
+            "val": int(np.sum(arrays["split"] == "val")),
+            "test": int(np.sum(arrays["split"] == "test")),
+        },
         "output_npz": str(args.out_npz),
         "output_ope_csv": str(args.out_ope_csv),
         "top_feature_codes": top_codes,

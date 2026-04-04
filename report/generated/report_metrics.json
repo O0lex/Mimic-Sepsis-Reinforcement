@@ -1,0 +1,43 @@
+{
+  "cohort_icu_encounters": 30,
+  "cohort_sepsis_patients": 16,
+  "n_transitions": 1320,
+  "state_dim": 16,
+  "split_counts": {
+    "train": 1020,
+    "val": 126,
+    "test": 174
+  },
+  "behavior_episode_return": -0.5,
+  "bc_wis_mean": -0.3148173794635596,
+  "bc_wis_ci95": [
+    -1.0,
+    0.5869130129875239
+  ],
+  "cql_wis_mean": -0.42360308923628254,
+  "cql_wis_ci95": [
+    -1.0,
+    0.9756636875492625
+  ],
+  "eval_split": "test",
+  "n_episodes_eval": 4,
+  "icu_sepsis": {
+    "n_episodes": 50,
+    "n_transitions": 359,
+    "state_dim": 716,
+    "avg_episode_return": 0.72,
+    "behavior_episode_return": 0.75,
+    "bc_wis_mean": 0.7717240820147546,
+    "bc_wis_ci95": [
+      0.4288945767841774,
+      1.0
+    ],
+    "cql_wis_mean": 0.7858448066670896,
+    "cql_wis_ci95": [
+      0.4975492982675797,
+      1.0
+    ],
+    "eval_split": "test",
+    "n_episodes_eval": 8
+  }
+}

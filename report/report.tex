@@ -1,0 +1,161 @@
+\documentclass[10pt]{article}
+\usepackage[margin=0.75in]{geometry}
+\usepackage[utf8]{inputenc}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{amsmath}
+\usepackage{graphicx}
+
+\title{Offline Reinforcement Learning for Sepsis Treatment\
+\large COMP 579 Final Project Report (Draft)}
+\author{Alex Groiser \and Yusuf Hamza}
+\date{April 2026}
+
+\begin{document}
+\maketitle
+\vspace{-0.6cm}
+
+\section{Motivation and Problem Setting}
+Sepsis remains a major cause of mortality in intensive care units. Clinical treatment requires sequential decisions over intravenous fluids and vasopressors under substantial uncertainty. This is naturally modeled as a finite-horizon Markov Decision Process (MDP), where states represent patient physiology, actions represent treatment decisions, and terminal outcomes reflect survival-oriented objectives. Because online experimentation is unsafe in this domain, we target \emph{offline reinforcement learning} (offline RL): learning solely from historical logged trajectories.
+
+Our project goal is to evaluate whether a conservative offline RL policy can outperform a behavior-cloning baseline under off-policy evaluation (OPE), while maintaining methodological discipline around data leakage, support mismatch, and reproducibility.
+
+\section{Related Work and Course Connection}
+Our approach is grounded in the offline RL literature and directly matches COMP 579 content on off-policy learning and policy evaluation.
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Conservative Q-Learning (CQL)} penalizes unsupported out-of-distribution actions and is designed for stable offline value learning (Kumar et al., 2020).
+  \item \textbf{Behavior Cloning (BC)} provides an imitation baseline and reflects the logged clinician policy.
+  \item \textbf{Weighted Importance Sampling (WIS)} provides an off-policy value estimator with lower variance than ordinary IS in many practical settings.
+  \item The pipeline aligns with lecture themes on off-policy RL, policy evaluation, and offline/batch RL (Feb 12, Mar 19, Mar 26 in the course schedule).
+\end{itemize}
+
+\section{Data and Cohort Construction}
+\subsection{Data Source}
+We implemented and validated the full pipeline on the publicly available \texttt{mimic-iv-clinical-database-demo-on-fhir-2.0} FHIR subset. This serves as an engineering and methodological proxy before running on full credentialed MIMIC-IV data.
+
+\subsection{Sepsis Cohort Logic}
+We select ICU encounters (\texttt{EncounterICU}) whose linked conditions include sepsis-related ICD patterns (e.g., A40/A41, 038, textual sepsis terms). Because FHIR encounter references may not always align one-to-one with ICU stay IDs, events are mapped to ICU windows by patient and timestamp when needed.
+
+\subsection{State, Action, Reward}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{State}: top 16 frequent numeric lab features from \texttt{ObservationLabevents} (code-frequency based), represented as hourly-updated vectors.
+  \item \textbf{Action}: discretized 2D treatment index from fluid amount and vasopressor intensity bins.
+  \item \textbf{Reward}: terminal survival proxy (+1 if alive at 30-day window, -1 if deceased), with 0 intermediate rewards.
+\end{itemize}
+
+\subsection{Methodological Safeguards}
+\begin{itemize}[leftmargin=*]
+  \item Patient-level \textbf{train/val/test} split (no transition-level mixing).
+  \item Behavior policy probabilities estimated from \textbf{train split only} (Laplace-smoothed frequency estimator) to reduce leakage.
+  \item Reproducible seeds and script-based execution for all stages.
+\end{itemize}
+
+\section{Methods}
+\subsection{Offline RL Algorithms}
+\textbf{BC baseline}: discrete behavior cloning with MLP encoder via \texttt{d3rlpy}.\\
+\textbf{CQL}: discrete CQL with conservative penalty coefficient $\alpha$ and fixed optimizer/architecture defaults from \texttt{d3rlpy}.
+
+\subsection{Evaluation Protocol}
+We use Weighted Importance Sampling (WIS) with bootstrap confidence intervals:
+\[
+\hat{V}_{\mathrm{WIS}} = \frac{\sum_i w_i G_i}{\sum_i w_i}, \quad w_i = \prod_t \frac{\pi(a_t\mid s_t)}{\mu(a_t\mid s_t)}
+\]
+where $\mu$ is the estimated behavior policy and $\pi$ is the candidate policy. We evaluate on held-out split data and report 95\% bootstrap CIs.
+
+\section{Implementation and Reproducibility}
+Pipeline stages are script-based:
+\begin{itemize}[leftmargin=*]
+  \item Data extraction: \texttt{src/data/extract\_sepsis\_cohort.py}
+  \item Dataset export: \texttt{src/data/build\_mdp\_dataset.py}
+  \item Training: \texttt{src/train/train\_bc.py}, \texttt{src/train/train\_cql.py}
+  \item OPE: \texttt{src/ope/wis\_eval.py}
+  \item End-to-end runner: \texttt{experiments/run\_all.py}
+\end{itemize}
+
+The project includes compatibility handling for \texttt{d3rlpy} API differences (dataset loading and constructor signatures), enabling consistent execution across local environments.
+
+\section{Results on Public Demo FHIR Data}
+Using the current pipeline outputs:
+\begin{itemize}[leftmargin=*]
+  \item Cohort ICU encounters: 30
+  \item Sepsis patients: 16
+  \item Transitions: 1320
+  \item State dimension: 16
+\end{itemize}
+
+OPE summary (WIS, 95\% CI):
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+Policy & Mean Return & 95\% CI Low & 95\% CI High \\
+\midrule
+Behavior (logged, test split) & -0.500 & -- & -- \\
+BC (proxy policy probs) & -0.315 & -1.000 & 0.587 \\
+CQL ($\alpha=1.0$, proxy policy probs) & -0.424 & -1.000 & 0.976 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Split diagnostics: train/val/test transitions are 1020/126/174 respectively, with only 4 held-out test episodes in this demo subset.
+
+\textbf{Interpretation}: On this small demo subset, uncertainty is substantial and confidence intervals overlap heavily. Results are therefore inconclusive and mainly validate pipeline correctness rather than clinical superiority claims.
+
+\section{Open-Benchmark Validation: ICU-Sepsis}
+To reduce schedule risk while waiting for credentialed data, we added an open benchmark track using \texttt{Sepsis/ICU-Sepsis-v2}. This provides a reproducible, no-approval-required environment for validating algorithm and evaluation plumbing.
+
+Observed benchmark summary (current run):
+\begin{itemize}[leftmargin=*]
+  \item Episodes: 50
+  \item Transitions: 359
+  \item State dimension: 716 (discrete-state one-hot encoding)
+  \item Test split episodes: 8
+\end{itemize}
+
+WIS summary on ICU-Sepsis test split:
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+Policy & Mean Return & 95\% CI Low & 95\% CI High \\
+\midrule
+Behavior (logged) & 0.750 & -- & -- \\
+BC (proxy policy probs) & 0.772 & 0.429 & 1.000 \\
+CQL ($\alpha=1.0$, proxy policy probs) & 0.786 & 0.498 & 1.000 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Interpretation}: ICU-Sepsis provides a stronger algorithmic smoke test than tiny FHIR subsets and helps verify that BC/CQL/OPE components are functioning consistently in a controlled benchmark setting. However, benchmark gains do not by themselves establish clinical validity on real MIMIC-IV.
+
+\section{Limitations and Validity Threats}
+\begin{itemize}[leftmargin=*]
+  \item The demo FHIR subset is not representative of full MIMIC-IV scale.
+  \item OPE policy probabilities for BC/CQL are currently proxy-level approximations in this draft pipeline; final submission should replace this with stronger policy-probability estimation or additional doubly robust analyses.
+  \item Action discretization and state selection are pragmatic first-pass choices and require sensitivity analysis.
+\end{itemize}
+
+\section{Planned Final Experiments on Credentialed MIMIC-IV}
+\begin{enumerate}[leftmargin=*]
+  \item Finalize sepsis cohort protocol and feature map with train-only normalization.
+  \item Run CQL hyperparameter sweeps ($\alpha$ and learning rate) across multiple random seeds.
+  \item Report subgroup and split sensitivity checks.
+  \item Extend OPE robustness (clipping sweeps, variance analysis, optional doubly robust estimator).
+\end{enumerate}
+
+\section{Contributions}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Alex Groiser}: data engineering, FHIR cohort extraction, MDP construction, reproducibility scaffolding.
+  \item \textbf{Yusuf Hamza}: training/evaluation integration, OPE pipeline, experiment orchestration and analysis.
+  \item \textbf{Shared}: report writing, interpretation, final validation and presentation.
+\end{itemize}
+
+\section*{References}
+\begin{enumerate}[leftmargin=*]
+  \item Wu, X., et al. (2023). \emph{A value-based deep reinforcement learning model with human expertise in optimal treatment of sepsis}. npj Digital Medicine.
+  \item Kumar, A., et al. (2020). \emph{Conservative Q-Learning for Offline Reinforcement Learning}. arXiv:2006.04779.
+  \item Johnson, A. E. W., et al. (2023). \emph{MIMIC-IV, a freely accessible electronic health record dataset}. Scientific Data.
+  \item Levine, S., Kumar, A., Tucker, G., and Fu, J. (2020). \emph{Offline Reinforcement Learning: Tutorial, Review, and Perspectives on Open Problems}. arXiv:2005.01643.
+  \item Wang, Z., et al. (2023). \emph{Diffusion Policies as an Expressive Representation for Offline RL}. ICLR.
+\end{enumerate}
+
+\end{document}

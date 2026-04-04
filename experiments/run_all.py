@@ -16,11 +16,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--python", type=str, default=sys.executable)
     parser.add_argument("--skip-train", action="store_true")
     parser.add_argument("--use-fhir", action="store_true")
+    parser.add_argument("--use-icu-sepsis", action="store_true")
     parser.add_argument(
         "--fhir-dir",
         type=str,
         default="data/mimic-iv-clinical-database-demo-on-fhir-2.0/mimic-fhir",
     )
+    parser.add_argument("--icu-env-id", type=str, default="Sepsis/ICU-Sepsis-v2")
     return parser.parse_args()
 
 
@@ -28,7 +30,34 @@ def main() -> None:
     args = _parse_args()
     root = Path(__file__).resolve().parents[1]
 
-    if args.use_fhir:
+    if args.use_fhir and args.use_icu_sepsis:
+        raise ValueError("Use either --use-fhir or --use-icu-sepsis, not both.")
+
+    if args.use_icu_sepsis:
+        steps = [
+            [
+                args.python,
+                "-m",
+                "src.data.extract_icu_sepsis_dataset",
+                "--env-id",
+                args.icu_env_id,
+                "--out-npz",
+                "outputs/data/icu_sepsis_mdp_raw.npz",
+                "--out-ope-csv",
+                "outputs/data/icu_sepsis_ope_table.csv",
+            ],
+            [
+                args.python,
+                "-m",
+                "src.data.build_mdp_dataset",
+                "--in-npz",
+                "outputs/data/icu_sepsis_mdp_raw.npz",
+                "--out-h5",
+                "outputs/data/icu_sepsis_mdp_dataset.h5",
+                "--force",
+            ],
+        ]
+    elif args.use_fhir:
         steps = [
             [
                 args.python,
@@ -59,7 +88,62 @@ def main() -> None:
         ]
 
     if not args.skip_train:
-        if args.use_fhir:
+        if args.use_icu_sepsis:
+            steps.extend(
+                [
+                    [
+                        args.python,
+                        "-m",
+                        "src.train.train_bc",
+                        "--dataset-h5",
+                        "outputs/data/icu_sepsis_mdp_dataset.h5",
+                        "--dataset-npz",
+                        "outputs/data/icu_sepsis_mdp_raw.npz",
+                        "--n-steps",
+                        "500",
+                    ],
+                    [
+                        args.python,
+                        "-m",
+                        "src.train.train_cql",
+                        "--dataset-h5",
+                        "outputs/data/icu_sepsis_mdp_dataset.h5",
+                        "--dataset-npz",
+                        "outputs/data/icu_sepsis_mdp_raw.npz",
+                        "--alpha",
+                        "0.1",
+                        "--n-steps",
+                        "500",
+                    ],
+                    [
+                        args.python,
+                        "-m",
+                        "src.train.train_cql",
+                        "--dataset-h5",
+                        "outputs/data/icu_sepsis_mdp_dataset.h5",
+                        "--dataset-npz",
+                        "outputs/data/icu_sepsis_mdp_raw.npz",
+                        "--alpha",
+                        "1.0",
+                        "--n-steps",
+                        "500",
+                    ],
+                    [
+                        args.python,
+                        "-m",
+                        "src.train.train_cql",
+                        "--dataset-h5",
+                        "outputs/data/icu_sepsis_mdp_dataset.h5",
+                        "--dataset-npz",
+                        "outputs/data/icu_sepsis_mdp_raw.npz",
+                        "--alpha",
+                        "5.0",
+                        "--n-steps",
+                        "500",
+                    ],
+                ]
+            )
+        elif args.use_fhir:
             steps.extend(
                 [
                     [
@@ -124,7 +208,19 @@ def main() -> None:
                 ]
             )
 
-    if args.use_fhir:
+    if args.use_icu_sepsis:
+        steps.append(
+            [
+                args.python,
+                "-m",
+                "src.ope.wis_eval",
+                "--in-csv",
+                "outputs/data/icu_sepsis_ope_table.csv",
+                "--out-json",
+                "outputs/ope/icu_sepsis_wis_summary.json",
+            ]
+        )
+    elif args.use_fhir:
         steps.append(
             [
                 args.python,

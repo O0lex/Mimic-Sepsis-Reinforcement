@@ -77,13 +77,33 @@ cd finalProj
 python experiments/run_all.py --use-fhir
 ```
 
-## 4) Files To Replace For Real MIMIC-IV Data
+## 4) ICU-Sepsis Open Benchmark Pipeline
+
+This benchmark is useful when full credentialed MIMIC-IV access is pending.
+
+```powershell
+cd finalProj
+python -m src.data.extract_icu_sepsis_dataset --env-id Sepsis/ICU-Sepsis-v2
+python -m src.data.build_mdp_dataset --in-npz outputs/data/icu_sepsis_mdp_raw.npz --out-h5 outputs/data/icu_sepsis_mdp_dataset.h5 --force
+python -m src.train.train_bc --dataset-h5 outputs/data/icu_sepsis_mdp_dataset.h5 --dataset-npz outputs/data/icu_sepsis_mdp_raw.npz --n-steps 200
+python -m src.train.train_cql --dataset-h5 outputs/data/icu_sepsis_mdp_dataset.h5 --dataset-npz outputs/data/icu_sepsis_mdp_raw.npz --alpha 1.0 --n-steps 200
+python -m src.ope.wis_eval --in-csv outputs/data/icu_sepsis_ope_table.csv --out-json outputs/ope/icu_sepsis_wis_summary.json
+```
+
+Or end-to-end:
+
+```powershell
+cd finalProj
+python experiments/run_all.py --use-icu-sepsis
+```
+
+## 5) Files To Replace For Real MIMIC-IV Data
 
 - `src/data/mock_dataset.py`: replace with true MIMIC-IV cohort extraction and trajectory build.
 - `src/data/build_mdp_dataset.py`: keep export logic, switch input from mock arrays to real features/actions/rewards.
 - `src/ope/wis_eval.py`: connect to policy action probabilities from BC/CQL inference on held-out trajectories.
 
-## 5) Output Artifacts
+## 6) Output Artifacts
 
 Generated under `finalProj/outputs`:
 - `outputs/data/mock_mdp_raw.npz`
@@ -94,12 +114,15 @@ Generated under `finalProj/outputs`:
 - `outputs/data/mimic_fhir_mdp_raw.npz`
 - `outputs/data/mimic_fhir_mdp_dataset.h5`
 - `outputs/ope/mimic_fhir_wis_summary.json`
+- `outputs/data/icu_sepsis_mdp_raw.npz`
+- `outputs/data/icu_sepsis_mdp_dataset.h5`
+- `outputs/ope/icu_sepsis_wis_summary.json`
 
-## 6) Next Implementation Step
+## 7) Next Implementation Step
 
 Implement `src/data/extract_sepsis_cohort.py` for MIMIC-IV credentialed SQL extraction once access is approved.
 
-## 7) Initialize Git And Push
+## 8) Initialize Git And Push
 
 From `finalProj`:
 
