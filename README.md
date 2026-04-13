@@ -5,6 +5,8 @@ This folder contains a scripts-first implementation scaffold for:
 - Offline RL training with d3rlpy (BC + CQL)
 - Off-policy evaluation with weighted importance sampling (WIS)
 
+For a detailed file-by-file implementation guide, see [TECHNICAL_README.md](TECHNICAL_README.md).
+
 ## 0) Collaboration Quick Setup
 
 1. Create a new GitHub repository (empty, no template).
