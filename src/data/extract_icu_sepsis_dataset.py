@@ -153,6 +153,7 @@ def main() -> None:
         {
             "episode_id": ep_ids_np,
             "reward": rew_np,
+            "action": act_np,
             "mu_prob": mu_np,
             "bc_prob": bc_prob,
             "cql_prob": cql_prob,

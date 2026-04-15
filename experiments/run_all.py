@@ -17,12 +17,21 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-train", action="store_true")
     parser.add_argument("--use-fhir", action="store_true")
     parser.add_argument("--use-icu-sepsis", action="store_true")
+    parser.add_argument("--use-bigquery", action="store_true")
     parser.add_argument(
         "--fhir-dir",
         type=str,
         default="data/mimic-iv-clinical-database-demo-on-fhir-2.0/mimic-fhir",
     )
     parser.add_argument("--icu-env-id", type=str, default="Sepsis/ICU-Sepsis-v2")
+    parser.add_argument("--gcp-project-id", type=str, default="")
+    parser.add_argument("--bq-location", type=str, default="US")
+    parser.add_argument("--mimic-project", type=str, default="physionet-data")
+    parser.add_argument("--derived-dataset", type=str, default="mimiciv_derived")
+    parser.add_argument("--icu-dataset", type=str, default="mimiciv_icu")
+    parser.add_argument("--hosp-dataset", type=str, default="mimiciv_hosp")
+    parser.add_argument("--max-stays", type=int, default=500)
+    parser.add_argument("--mu-source", type=str, choices=["auto", "csv", "bc_model"], default="auto")
     return parser.parse_args()
 
 
@@ -30,10 +39,23 @@ def main() -> None:
     args = _parse_args()
     root = Path(__file__).resolve().parents[1]
 
-    if args.use_fhir and args.use_icu_sepsis:
-        raise ValueError("Use either --use-fhir or --use-icu-sepsis, not both.")
+    mode_flags = [args.use_fhir, args.use_icu_sepsis, args.use_bigquery]
+    if sum(1 for x in mode_flags if x) > 1:
+        raise ValueError("Use only one of --use-fhir, --use-icu-sepsis, or --use-bigquery.")
+
+    if args.use_bigquery and not args.gcp_project_id:
+        raise ValueError("--use-bigquery requires --gcp-project-id.")
+
+    dataset_npz = "outputs/data/mock_mdp_raw.npz"
+    dataset_h5 = "outputs/data/mock_mdp_dataset.h5"
+    ope_csv = "outputs/data/mock_ope_table.csv"
+    wis_json = "outputs/ope/wis_summary.json"
 
     if args.use_icu_sepsis:
+        dataset_npz = "outputs/data/icu_sepsis_mdp_raw.npz"
+        dataset_h5 = "outputs/data/icu_sepsis_mdp_dataset.h5"
+        ope_csv = "outputs/data/icu_sepsis_ope_table.csv"
+        wis_json = "outputs/ope/icu_sepsis_wis_summary.json"
         steps = [
             [
                 args.python,
@@ -42,22 +64,26 @@ def main() -> None:
                 "--env-id",
                 args.icu_env_id,
                 "--out-npz",
-                "outputs/data/icu_sepsis_mdp_raw.npz",
+                dataset_npz,
                 "--out-ope-csv",
-                "outputs/data/icu_sepsis_ope_table.csv",
+                ope_csv,
             ],
             [
                 args.python,
                 "-m",
                 "src.data.build_mdp_dataset",
                 "--in-npz",
-                "outputs/data/icu_sepsis_mdp_raw.npz",
+                dataset_npz,
                 "--out-h5",
-                "outputs/data/icu_sepsis_mdp_dataset.h5",
+                dataset_h5,
                 "--force",
             ],
         ]
     elif args.use_fhir:
+        dataset_npz = "outputs/data/mimic_fhir_mdp_raw.npz"
+        dataset_h5 = "outputs/data/mimic_fhir_mdp_dataset.h5"
+        ope_csv = "outputs/data/mimic_fhir_ope_table.csv"
+        wis_json = "outputs/ope/mimic_fhir_wis_summary.json"
         steps = [
             [
                 args.python,
@@ -66,18 +92,58 @@ def main() -> None:
                 "--fhir-dir",
                 args.fhir_dir,
                 "--out-npz",
-                "outputs/data/mimic_fhir_mdp_raw.npz",
+                dataset_npz,
                 "--out-ope-csv",
-                "outputs/data/mimic_fhir_ope_table.csv",
+                ope_csv,
             ],
             [
                 args.python,
                 "-m",
                 "src.data.build_mdp_dataset",
                 "--in-npz",
-                "outputs/data/mimic_fhir_mdp_raw.npz",
+                dataset_npz,
                 "--out-h5",
-                "outputs/data/mimic_fhir_mdp_dataset.h5",
+                dataset_h5,
+                "--force",
+            ],
+        ]
+    elif args.use_bigquery:
+        dataset_npz = "outputs/data/mimic_bq_mdp_raw.npz"
+        dataset_h5 = "outputs/data/mimic_bq_mdp_dataset.h5"
+        ope_csv = "outputs/data/mimic_bq_ope_table.csv"
+        wis_json = "outputs/ope/mimic_bq_wis_summary.json"
+        steps = [
+            [
+                args.python,
+                "-m",
+                "src.data.extract_sepsis_cohort_bigquery",
+                "--gcp-project-id",
+                args.gcp_project_id,
+                "--bq-location",
+                args.bq_location,
+                "--mimic-project",
+                args.mimic_project,
+                "--derived-dataset",
+                args.derived_dataset,
+                "--icu-dataset",
+                args.icu_dataset,
+                "--hosp-dataset",
+                args.hosp_dataset,
+                "--max-stays",
+                str(args.max_stays),
+                "--out-npz",
+                dataset_npz,
+                "--out-ope-csv",
+                ope_csv,
+            ],
+            [
+                args.python,
+                "-m",
+                "src.data.build_mdp_dataset",
+                "--in-npz",
+                dataset_npz,
+                "--out-h5",
+                dataset_h5,
                 "--force",
             ],
         ]
@@ -96,9 +162,9 @@ def main() -> None:
                         "-m",
                         "src.train.train_bc",
                         "--dataset-h5",
-                        "outputs/data/icu_sepsis_mdp_dataset.h5",
+                        dataset_h5,
                         "--dataset-npz",
-                        "outputs/data/icu_sepsis_mdp_raw.npz",
+                        dataset_npz,
                         "--n-steps",
                         "500",
                     ],
@@ -107,9 +173,9 @@ def main() -> None:
                         "-m",
                         "src.train.train_cql",
                         "--dataset-h5",
-                        "outputs/data/icu_sepsis_mdp_dataset.h5",
+                        dataset_h5,
                         "--dataset-npz",
-                        "outputs/data/icu_sepsis_mdp_raw.npz",
+                        dataset_npz,
                         "--alpha",
                         "0.1",
                         "--n-steps",
@@ -120,9 +186,9 @@ def main() -> None:
                         "-m",
                         "src.train.train_cql",
                         "--dataset-h5",
-                        "outputs/data/icu_sepsis_mdp_dataset.h5",
+                        dataset_h5,
                         "--dataset-npz",
-                        "outputs/data/icu_sepsis_mdp_raw.npz",
+                        dataset_npz,
                         "--alpha",
                         "1.0",
                         "--n-steps",
@@ -133,9 +199,9 @@ def main() -> None:
                         "-m",
                         "src.train.train_cql",
                         "--dataset-h5",
-                        "outputs/data/icu_sepsis_mdp_dataset.h5",
+                        dataset_h5,
                         "--dataset-npz",
-                        "outputs/data/icu_sepsis_mdp_raw.npz",
+                        dataset_npz,
                         "--alpha",
                         "5.0",
                         "--n-steps",
@@ -151,9 +217,9 @@ def main() -> None:
                         "-m",
                         "src.train.train_bc",
                         "--dataset-h5",
-                        "outputs/data/mimic_fhir_mdp_dataset.h5",
+                        dataset_h5,
                         "--dataset-npz",
-                        "outputs/data/mimic_fhir_mdp_raw.npz",
+                        dataset_npz,
                         "--n-steps",
                         "500",
                     ],
@@ -162,9 +228,9 @@ def main() -> None:
                         "-m",
                         "src.train.train_cql",
                         "--dataset-h5",
-                        "outputs/data/mimic_fhir_mdp_dataset.h5",
+                        dataset_h5,
                         "--dataset-npz",
-                        "outputs/data/mimic_fhir_mdp_raw.npz",
+                        dataset_npz,
                         "--alpha",
                         "0.1",
                         "--n-steps",
@@ -175,9 +241,9 @@ def main() -> None:
                         "-m",
                         "src.train.train_cql",
                         "--dataset-h5",
-                        "outputs/data/mimic_fhir_mdp_dataset.h5",
+                        dataset_h5,
                         "--dataset-npz",
-                        "outputs/data/mimic_fhir_mdp_raw.npz",
+                        dataset_npz,
                         "--alpha",
                         "1.0",
                         "--n-steps",
@@ -188,9 +254,64 @@ def main() -> None:
                         "-m",
                         "src.train.train_cql",
                         "--dataset-h5",
-                        "outputs/data/mimic_fhir_mdp_dataset.h5",
+                        dataset_h5,
                         "--dataset-npz",
-                        "outputs/data/mimic_fhir_mdp_raw.npz",
+                        dataset_npz,
+                        "--alpha",
+                        "5.0",
+                        "--n-steps",
+                        "500",
+                    ],
+                ]
+            )
+        elif args.use_bigquery:
+            steps.extend(
+                [
+                    [
+                        args.python,
+                        "-m",
+                        "src.train.train_bc",
+                        "--dataset-h5",
+                        dataset_h5,
+                        "--dataset-npz",
+                        dataset_npz,
+                        "--n-steps",
+                        "500",
+                    ],
+                    [
+                        args.python,
+                        "-m",
+                        "src.train.train_cql",
+                        "--dataset-h5",
+                        dataset_h5,
+                        "--dataset-npz",
+                        dataset_npz,
+                        "--alpha",
+                        "0.1",
+                        "--n-steps",
+                        "500",
+                    ],
+                    [
+                        args.python,
+                        "-m",
+                        "src.train.train_cql",
+                        "--dataset-h5",
+                        dataset_h5,
+                        "--dataset-npz",
+                        dataset_npz,
+                        "--alpha",
+                        "1.0",
+                        "--n-steps",
+                        "500",
+                    ],
+                    [
+                        args.python,
+                        "-m",
+                        "src.train.train_cql",
+                        "--dataset-h5",
+                        dataset_h5,
+                        "--dataset-npz",
+                        dataset_npz,
                         "--alpha",
                         "5.0",
                         "--n-steps",
@@ -208,32 +329,38 @@ def main() -> None:
                 ]
             )
 
-    if args.use_icu_sepsis:
-        steps.append(
+    mu_source = args.mu_source
+    if mu_source == "auto":
+        mu_source = "bc_model" if not args.skip_train else "csv"
+
+    wis_step = [
+        args.python,
+        "-m",
+        "src.ope.wis_eval",
+        "--in-csv",
+        ope_csv,
+        "--out-json",
+        wis_json,
+        "--out-csv",
+        ope_csv,
+        "--mu-source",
+        mu_source,
+    ]
+
+    if mu_source == "bc_model":
+        wis_step.extend(
             [
-                args.python,
-                "-m",
-                "src.ope.wis_eval",
-                "--in-csv",
-                "outputs/data/icu_sepsis_ope_table.csv",
-                "--out-json",
-                "outputs/ope/icu_sepsis_wis_summary.json",
+                "--dataset-npz",
+                dataset_npz,
+                "--bc-model",
+                "outputs/models/bc/bc_model.d3",
+                "--cql-model",
+                "outputs/models/cql/alpha_1/cql_model.d3",
+                "--sync-bc-prob-with-mu",
             ]
         )
-    elif args.use_fhir:
-        steps.append(
-            [
-                args.python,
-                "-m",
-                "src.ope.wis_eval",
-                "--in-csv",
-                "outputs/data/mimic_fhir_ope_table.csv",
-                "--out-json",
-                "outputs/ope/mimic_fhir_wis_summary.json",
-            ]
-        )
-    else:
-        steps.append([args.python, "-m", "src.ope.wis_eval"])
+
+    steps.append(wis_step)
 
     for cmd in steps:
         _run(cmd, cwd=root)

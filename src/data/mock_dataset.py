@@ -125,6 +125,7 @@ def main() -> None:
         {
             "episode_id": data["episode_ids"],
             "reward": data["rewards"],
+            "action": data["actions"],
             "mu_prob": data["behavior_probs"],
             "bc_prob": data["bc_probs"],
             "cql_prob": data["cql_probs"],

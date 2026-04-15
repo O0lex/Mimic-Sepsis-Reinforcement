@@ -11,3 +11,5 @@ d3rlpy
 jupyter
 pyarrow
 icu-sepsis
+google-cloud-bigquery
+db-dtypes

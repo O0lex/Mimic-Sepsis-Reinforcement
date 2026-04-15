@@ -99,13 +99,32 @@ cd finalProj
 python experiments/run_all.py --use-icu-sepsis
 ```
 
-## 5) Files To Replace For Real MIMIC-IV Data
+## 5) Full MIMIC-IV BigQuery Sepsis-3 Pipeline
+
+This mode uses the `mimiciv_derived.sepsis3` table as the Sepsis-3 cohort source and builds RL arrays directly from BigQuery tables.
+
+Before running:
+
+1. Authenticate with Google Cloud (`gcloud auth application-default login`) or set `GOOGLE_APPLICATION_CREDENTIALS`.
+2. Ensure your account has BigQuery read access to MIMIC-IV datasets.
+
+```powershell
+cd finalProj
+python experiments/run_all.py --use-bigquery --gcp-project-id <your-gcp-project-id> --max-stays 500
+```
+
+Notes:
+
+- Vasopressors are normalized to NE-equivalent dose in extraction.
+- WIS can use BC-model behavior probabilities (`mu = P_BC(a_logged | s)`) via model-based mode.
+
+## 6) Files To Replace For Real MIMIC-IV Data
 
 - `src/data/mock_dataset.py`: replace with true MIMIC-IV cohort extraction and trajectory build.
 - `src/data/build_mdp_dataset.py`: keep export logic, switch input from mock arrays to real features/actions/rewards.
 - `src/ope/wis_eval.py`: connect to policy action probabilities from BC/CQL inference on held-out trajectories.
 
-## 6) Output Artifacts
+## 7) Output Artifacts
 
 Generated under `finalProj/outputs`:
 - `outputs/data/mock_mdp_raw.npz`
@@ -119,12 +138,15 @@ Generated under `finalProj/outputs`:
 - `outputs/data/icu_sepsis_mdp_raw.npz`
 - `outputs/data/icu_sepsis_mdp_dataset.h5`
 - `outputs/ope/icu_sepsis_wis_summary.json`
+- `outputs/data/mimic_bq_mdp_raw.npz`
+- `outputs/data/mimic_bq_mdp_dataset.h5`
+- `outputs/ope/mimic_bq_wis_summary.json`
 
-## 7) Next Implementation Step
+## 8) Next Implementation Step
 
-Implement `src/data/extract_sepsis_cohort.py` for MIMIC-IV credentialed SQL extraction once access is approved.
+Run the BigQuery pipeline on your full authorized MIMIC-IV cohort and validate table-specific schema assumptions for your project's mirror.
 
-## 8) Initialize Git And Push
+## 9) Initialize Git And Push
 
 From `finalProj`:
 

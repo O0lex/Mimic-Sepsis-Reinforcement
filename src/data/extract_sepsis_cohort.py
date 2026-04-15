@@ -35,6 +35,48 @@ VASPRESSOR_NAMES = (
 )
 
 
+def _to_ne_equivalent_vaso(
+    display: str,
+    rate_value: float | None,
+    rate_unit: str,
+    dose_value: float | None,
+    dose_unit: str,
+) -> float:
+    display_l = (display or "").lower()
+    rate_u = (rate_unit or "").lower()
+    dose_u = (dose_unit or "").lower()
+
+    ne_mcg_min = 0.0
+    epi_mcg_min = 0.0
+    vaso_units_min = 0.0
+    dopamine_mcgkg_min = 0.0
+
+    if "norepinephrine" in display_l:
+        if rate_value is not None and "mcg/min" in rate_u:
+            ne_mcg_min = max(0.0, float(rate_value))
+        elif dose_value is not None and "mcg" in dose_u:
+            ne_mcg_min = max(0.0, float(dose_value))
+
+    if "epinephrine" in display_l and "norepinephrine" not in display_l:
+        if rate_value is not None and "mcg/min" in rate_u:
+            epi_mcg_min = max(0.0, float(rate_value))
+        elif dose_value is not None and "mcg" in dose_u:
+            epi_mcg_min = max(0.0, float(dose_value))
+
+    if "vasopressin" in display_l:
+        if rate_value is not None and "unit/min" in rate_u:
+            vaso_units_min = max(0.0, float(rate_value))
+        elif dose_value is not None and "unit" in dose_u:
+            vaso_units_min = max(0.0, float(dose_value))
+
+    if "dopamine" in display_l:
+        if rate_value is not None and "mcg/kg/min" in rate_u:
+            dopamine_mcgkg_min = max(0.0, float(rate_value))
+
+    ne_equiv = ne_mcg_min + epi_mcg_min + (vaso_units_min * 2.5) + (dopamine_mcgkg_min / 2.0)
+    return float(max(0.0, ne_equiv))
+
+
 @dataclass
 class EncounterInfo:
     patient_id: str
@@ -258,6 +300,7 @@ def _collect_actions(
         dose_value = ((dosage.get("dose") or {}).get("value"))
         dose_unit = str(((dosage.get("dose") or {}).get("unit") or "")).lower()
         rate_value = ((dosage.get("rateQuantity") or {}).get("value"))
+        rate_unit = str(((dosage.get("rateQuantity") or {}).get("unit") or "")).lower()
 
         period = row.get("effectivePeriod") or {}
         ts = _to_timestamp(row.get("effectiveDateTime"))
@@ -285,10 +328,13 @@ def _collect_actions(
 
         vasopressor_rate = 0.0
         if any(name in display for name in VASPRESSOR_NAMES):
-            if rate_value is not None:
-                vasopressor_rate = float(rate_value)
-            elif dose_value is not None:
-                vasopressor_rate = float(dose_value)
+            vasopressor_rate = _to_ne_equivalent_vaso(
+                display=display,
+                rate_value=float(rate_value) if rate_value is not None else None,
+                rate_unit=rate_unit,
+                dose_value=float(dose_value) if dose_value is not None else None,
+                dose_unit=dose_unit,
+            )
 
         actions.append(
             {
@@ -517,6 +563,7 @@ def main() -> None:
         {
             "episode_id": arrays["episode_ids"],
             "reward": arrays["rewards"],
+            "action": arrays["actions"],
             "mu_prob": arrays["behavior_probs"],
             "bc_prob": arrays["bc_probs"],
             "cql_prob": arrays["cql_probs"],
@@ -543,6 +590,7 @@ def main() -> None:
         "output_npz": str(args.out_npz),
         "output_ope_csv": str(args.out_ope_csv),
         "top_feature_codes": top_codes,
+        "vasopressor_normalization": "NE-equivalent: NE + EPI + 2.5*Vasopressin(units/min) + 0.5*Dopamine(mcg/kg/min)",
     }
     write_json(Path("outputs/data/mimic_fhir_summary.json"), summary)
 

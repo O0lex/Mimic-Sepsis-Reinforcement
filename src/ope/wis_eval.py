@@ -10,6 +10,132 @@ from src.common.io import write_json
 from src.common.seed import set_seed
 
 
+def _build_d3_dataset_from_npz(npz_path: Path):
+    try:
+        from d3rlpy.dataset import MDPDataset
+    except ImportError as exc:
+        raise RuntimeError("d3rlpy is required for model-based probability estimation.") from exc
+
+    arrays = np.load(npz_path)
+    observations = arrays["observations"]
+    actions = arrays["actions"]
+    rewards = arrays["rewards"]
+    terminals = arrays["terminals"]
+    timeouts = np.zeros_like(terminals, dtype=np.float32)
+
+    try:
+        dataset = MDPDataset(
+            observations=observations,
+            actions=actions,
+            rewards=rewards,
+            terminals=terminals,
+            timeouts=timeouts,
+        )
+    except TypeError:
+        dataset = MDPDataset(
+            observations=observations,
+            actions=actions,
+            rewards=rewards,
+            terminals=terminals,
+            episode_terminals=arrays["episode_terminals"],
+        )
+
+    return dataset, arrays
+
+
+def _predict_logged_probs_bc(
+    observations: np.ndarray,
+    actions: np.ndarray,
+    dataset,
+    bc_model_path: Path,
+    batch_size: int,
+) -> np.ndarray:
+    try:
+        import d3rlpy
+        import torch
+    except ImportError as exc:
+        raise RuntimeError("d3rlpy and torch are required for BC-based mu estimation.") from exc
+
+    algo = d3rlpy.algos.DiscreteBCConfig().create(device="cpu")
+    algo.build_with_dataset(dataset)
+    algo.load_model(str(bc_model_path))
+
+    imitator = None
+    modules = getattr(algo.impl, "modules", None)
+    if modules is not None:
+        imitator = getattr(modules, "imitator", None)
+    if imitator is None:
+        imitator = getattr(algo.impl, "_imitator", None)
+    if imitator is None:
+        raise RuntimeError("Unable to locate BC imitator network for probability extraction.")
+
+    n = observations.shape[0]
+    logged_probs = np.empty((n,), dtype=np.float64)
+    action_idx = np.clip(actions.astype(np.int64), 0, None)
+
+    for start in range(0, n, max(1, batch_size)):
+        end = min(n, start + max(1, batch_size))
+        obs_t = torch.tensor(observations[start:end], dtype=torch.float32)
+        with torch.no_grad():
+            dist_or_logits = imitator(obs_t)
+
+        if hasattr(dist_or_logits, "probs"):
+            probs = dist_or_logits.probs.detach().cpu().numpy()
+        else:
+            logits = dist_or_logits.detach().cpu().numpy()
+            logits = logits - np.max(logits, axis=1, keepdims=True)
+            exp_logits = np.exp(logits)
+            probs = exp_logits / np.clip(np.sum(exp_logits, axis=1, keepdims=True), 1e-12, None)
+
+        max_action = probs.shape[1] - 1
+        sel = np.clip(action_idx[start:end], 0, max_action)
+        logged_probs[start:end] = probs[np.arange(probs.shape[0]), sel]
+
+    return np.clip(logged_probs, 1e-8, 1.0)
+
+
+def _predict_logged_probs_cql(
+    observations: np.ndarray,
+    actions: np.ndarray,
+    dataset,
+    cql_model_path: Path,
+    temperature: float,
+    batch_size: int,
+) -> np.ndarray:
+    try:
+        import d3rlpy
+        import torch
+    except ImportError as exc:
+        raise RuntimeError("d3rlpy and torch are required for CQL probability estimation.") from exc
+
+    algo = d3rlpy.algos.DiscreteCQLConfig(alpha=1.0).create(device="cpu")
+    algo.build_with_dataset(dataset)
+    algo.load_model(str(cql_model_path))
+
+    q_forwarder = getattr(algo.impl, "_q_func_forwarder", None)
+    if q_forwarder is None or not hasattr(q_forwarder, "compute_expected_q"):
+        raise RuntimeError("Unable to locate CQL q-function forwarder for probability extraction.")
+
+    n = observations.shape[0]
+    logged_probs = np.empty((n,), dtype=np.float64)
+    action_idx = np.clip(actions.astype(np.int64), 0, None)
+    temp = max(1e-6, float(temperature))
+
+    for start in range(0, n, max(1, batch_size)):
+        end = min(n, start + max(1, batch_size))
+        obs_t = torch.tensor(observations[start:end], dtype=torch.float32)
+        with torch.no_grad():
+            q = q_forwarder.compute_expected_q(obs_t)
+            probs_t = torch.softmax(q / temp, dim=1)
+        probs = probs_t.detach().cpu().numpy()
+
+        max_action = probs.shape[1] - 1
+        sel = np.clip(action_idx[start:end], 0, max_action)
+        logged_probs[start:end] = probs[np.arange(probs.shape[0]), sel]
+
+    return np.clip(logged_probs, 1e-8, 1.0)
+
+
 def build_episode_arrays(df: pd.DataFrame, policy_col: str, clip: float | None = None) -> tuple[np.ndarray, np.ndarray]:
     grouped = df.groupby("episode_id", sort=False)
     episode_weights = []
@@ -56,10 +182,18 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run WIS OPE for BC and CQL policies.")
     parser.add_argument("--in-csv", type=Path, default=Path("outputs/data/mock_ope_table.csv"))
     parser.add_argument("--out-json", type=Path, default=Path("outputs/ope/wis_summary.json"))
+    parser.add_argument("--out-csv", type=Path, default=None)
     parser.add_argument("--clip", type=float, default=20.0)
     parser.add_argument("--n-boot", type=int, default=200)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--eval-split", type=str, default="test")
+    parser.add_argument("--mu-source", type=str, choices=["csv", "bc_model"], default="csv")
+    parser.add_argument("--dataset-npz", type=Path, default=None)
+    parser.add_argument("--bc-model", type=Path, default=None)
+    parser.add_argument("--cql-model", type=Path, default=None)
+    parser.add_argument("--cql-temperature", type=float, default=1.0)
+    parser.add_argument("--prob-batch-size", type=int, default=2048)
+    parser.add_argument("--sync-bc-prob-with-mu", action="store_true")
     return parser.parse_args()
 
 
@@ -73,6 +207,51 @@ def main() -> None:
     missing = required_cols - set(df.columns)
     if missing:
         raise ValueError(f"Missing required columns: {sorted(missing)}")
+
+    if args.mu_source == "bc_model":
+        if args.dataset_npz is None or args.bc_model is None:
+            raise ValueError("--mu-source bc_model requires --dataset-npz and --bc-model.")
+        if not args.dataset_npz.exists():
+            raise FileNotFoundError(f"Dataset NPZ not found: {args.dataset_npz}")
+        if not args.bc_model.exists():
+            raise FileNotFoundError(f"BC model file not found: {args.bc_model}")
+
+        dataset, arrays = _build_d3_dataset_from_npz(args.dataset_npz)
+        observations = arrays["observations"]
+        actions = arrays["actions"].astype(np.int64)
+
+        if df.shape[0] != observations.shape[0]:
+            raise ValueError(
+                f"CSV rows ({df.shape[0]}) do not match dataset transitions ({observations.shape[0]})."
+            )
+
+        bc_mu = _predict_logged_probs_bc(
+            observations=observations,
+            actions=actions,
+            dataset=dataset,
+            bc_model_path=args.bc_model,
+            batch_size=args.prob_batch_size,
+        )
+        df["mu_prob"] = bc_mu
+
+        if args.sync_bc_prob_with_mu:
+            df["bc_prob"] = bc_mu
+
+        if args.cql_model is not None:
+            if not args.cql_model.exists():
+                raise FileNotFoundError(f"CQL model file not found: {args.cql_model}")
+            cql_probs = _predict_logged_probs_cql(
+                observations=observations,
+                actions=actions,
+                dataset=dataset,
+                cql_model_path=args.cql_model,
+                temperature=args.cql_temperature,
+                batch_size=args.prob_batch_size,
+            )
+            df["cql_prob"] = cql_probs
+
+        if "action" not in df.columns:
+            df["action"] = actions
 
     split_used = "all"
     if "split" in df.columns and args.eval_split:
@@ -100,7 +279,15 @@ def main() -> None:
         "n_transitions_eval": int(df.shape[0]),
         "n_episodes_eval": int(df["episode_id"].nunique()),
         "input_csv": str(args.in_csv),
+        "mu_source": args.mu_source,
+        "dataset_npz": str(args.dataset_npz) if args.dataset_npz is not None else None,
+        "bc_model": str(args.bc_model) if args.bc_model is not None else None,
+        "cql_model": str(args.cql_model) if args.cql_model is not None else None,
     }
+
+    if args.out_csv is not None:
+        args.out_csv.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(args.out_csv, index=False)
 
     write_json(args.out_json, summary)
     print("WIS evaluation complete")
