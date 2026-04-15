@@ -121,6 +121,57 @@ Notes:
 - WIS can use BC-model behavior probabilities (`mu = P_BC(a_logged | s)`) via model-based mode.
 - End-to-end runs auto-generate paper-style metrics and figures in `report/generated/figures/`.
 
+### Large-table preprocessing with two feature profiles
+
+If you downloaded the merged BigQuery table to parquet (e.g., `data/raw/mimic_sepsis_final.parquet`), build both state profiles with:
+
+```powershell
+cd finalProj
+python -m src.data.preprocess --in-parquet data/raw/mimic_sepsis_final.parquet --out-dir outputs/data
+```
+
+This produces:
+
+- Minimal profile NPZ: `outputs/data/mimic_mdp_minimal_raw.npz`
+- Full profile NPZ: `outputs/data/mimic_mdp_full_raw.npz`
+- Profile summary: `outputs/data/mimic_mdp_profiles_summary.json`
+
+To export d3rlpy datasets:
+
+```powershell
+python -m src.data.build_mdp_dataset --in-npz outputs/data/mimic_mdp_minimal_raw.npz --out-h5 outputs/data/mimic_mdp_minimal_dataset.h5 --force
+python -m src.data.build_mdp_dataset --in-npz outputs/data/mimic_mdp_full_raw.npz --out-h5 outputs/data/mimic_mdp_full_dataset.h5 --force
+```
+
+To train on each profile:
+
+```powershell
+python -m src.train.train_bc --dataset-h5 outputs/data/mimic_mdp_minimal_dataset.h5 --dataset-npz outputs/data/mimic_mdp_minimal_raw.npz
+python -m src.train.train_cql --dataset-h5 outputs/data/mimic_mdp_minimal_dataset.h5 --dataset-npz outputs/data/mimic_mdp_minimal_raw.npz --alpha 1.0
+
+python -m src.train.train_bc --dataset-h5 outputs/data/mimic_mdp_full_dataset.h5 --dataset-npz outputs/data/mimic_mdp_full_raw.npz
+python -m src.train.train_cql --dataset-h5 outputs/data/mimic_mdp_full_dataset.h5 --dataset-npz outputs/data/mimic_mdp_full_raw.npz --alpha 1.0
+```
+
+Or run everything (preprocess, build dataset, train, WIS, report assets) from one command:
+
+```powershell
+python experiments/run_all.py --use-mimic-profiles --in-parquet data/raw/mimic_sepsis_final.parquet --profile both
+```
+
+Useful variants:
+
+```powershell
+# Minimal profile only
+python experiments/run_all.py --use-mimic-profiles --in-parquet data/raw/mimic_sepsis_final.parquet --profile minimal
+
+# Full profile only
+python experiments/run_all.py --use-mimic-profiles --in-parquet data/raw/mimic_sepsis_final.parquet --profile full
+
+# Build + evaluate only (skip training)
+python experiments/run_all.py --use-mimic-profiles --in-parquet data/raw/mimic_sepsis_final.parquet --profile both --skip-train
+```
+
 ## 6) Files To Replace For Real MIMIC-IV Data
 
 - `src/data/mock_dataset.py`: replace with true MIMIC-IV cohort extraction and trajectory build.

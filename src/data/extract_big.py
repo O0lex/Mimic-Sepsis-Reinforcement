@@ -9,7 +9,7 @@ def download_mimic_data():
     client = bigquery.Client(project=project_id)
     
     # 2. Define your table path
-    table_path = f"{project_id}.sepsis_research_v0.mdp_raw_v1"
+    table_path = f"{project_id}.sepsis_research_v0.mdp_final_v_complete"
     
     print(f"🚀 Starting download from {table_path}...")
     start_time = time.time()
@@ -23,7 +23,7 @@ def download_mimic_data():
         df = client.query(query).to_dataframe()
         
         # 4. Create output directory if it doesn't exist
-        out_dir = Path("outputs/data")
+        out_dir = Path("data/raw")
         out_dir.mkdir(parents=True, exist_ok=True)
         
         # 5. Save as Parquet

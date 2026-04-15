@@ -242,7 +242,33 @@ Outputs:
 - `outputs/data/mock_ope_table.csv`
 - `outputs/data/mock_summary.json`
 
-### 3.4 Dataset Conversion
+### 3.4 BigQuery Parquet Preprocessing Profiles
+
+#### `src/data/preprocess.py`
+
+This script preprocesses large merged clinical parquet tables (e.g., `mdp_final_v_complete` exports) into two RL-ready profiles:
+
+- Minimal profile: compact set for quick iteration.
+- Full profile: expanded clinical state with vitals, labs, SOFA organ scores, and demographics/comorbidities.
+
+Implemented logic includes:
+
+- grouped forward-fill/back-fill for sparse labs and SOFA signals (`lactate`, `creatinine_lab`, `wbc`, `sofa_total`, organ subscores, etc.)
+- terminal-only reward mapping using mortality labels
+- 5x5 fluid/vasopressor action discretization into 25 actions
+- gender conversion to numeric (`gender_bin`)
+- train-split-only normalization with `StandardScaler`
+- split-aware output fields for downstream OPE
+
+Outputs:
+
+- `outputs/data/mimic_mdp_minimal_raw.npz`
+- `outputs/data/mimic_mdp_full_raw.npz`
+- `outputs/data/mimic_mdp_minimal_ope_table.csv`
+- `outputs/data/mimic_mdp_full_ope_table.csv`
+- `outputs/data/mimic_mdp_profiles_summary.json`
+
+### 3.5 Dataset Conversion
 
 #### `src/data/build_mdp_dataset.py`
 
