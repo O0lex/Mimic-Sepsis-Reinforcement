@@ -9,18 +9,106 @@
     "test": 174
   },
   "behavior_episode_return": -0.5,
-  "bc_wis_mean": -0.3148173794635596,
+  "bc_wis_mean": -0.5025,
   "bc_wis_ci95": [
     -1.0,
-    0.5869130129875239
+    0.5
   ],
-  "cql_wis_mean": -0.42360308923628254,
+  "cql_wis_mean": -0.9872098535078664,
   "cql_wis_ci95": [
     -1.0,
-    0.9756636875492625
+    -0.9716840815616411
   ],
   "eval_split": "test",
   "n_episodes_eval": 4,
+  "behavior_survival_proxy": 0.25,
+  "bc_survival_proxy": 0.24875000000000003,
+  "cql_survival_proxy": 0.006395073246066807,
+  "value_survival_corr": 1.0,
+  "action_distribution_divergence": {
+    "js_clinician_vs_bc": 0.20784575661657756,
+    "js_clinician_vs_cql": 0.014178355999908118,
+    "js_bc_vs_cql": 0.15724918736368468
+  },
+  "top_features_rf_proxy": [
+    {
+      "feature": "51301",
+      "importance": 0.12862022621678149
+    },
+    {
+      "feature": "50868",
+      "importance": 0.10129778421215786
+    },
+    {
+      "feature": "50970",
+      "importance": 0.09449608545195759
+    },
+    {
+      "feature": "50912",
+      "importance": 0.07792608827753768
+    },
+    {
+      "feature": "51265",
+      "importance": 0.06998223634099172
+    },
+    {
+      "feature": "50902",
+      "importance": 0.06963183157144147
+    },
+    {
+      "feature": "50983",
+      "importance": 0.060370905413435406
+    },
+    {
+      "feature": "51006",
+      "importance": 0.05898809674489481
+    },
+    {
+      "feature": "51248",
+      "importance": 0.05180480017917421
+    },
+    {
+      "feature": "51221",
+      "importance": 0.047818036027460126
+    },
+    {
+      "feature": "50931",
+      "importance": 0.04692856074775954
+    },
+    {
+      "feature": "50971",
+      "importance": 0.04411301264394157
+    },
+    {
+      "feature": "50960",
+      "importance": 0.043026577620259875
+    },
+    {
+      "feature": "51222",
+      "importance": 0.03696260538100823
+    },
+    {
+      "feature": "50882",
+      "importance": 0.0351665864109939
+    },
+    {
+      "feature": "50893",
+      "importance": 0.03286656676020453
+    }
+  ],
+  "figures": {
+    "fig2_training_objective_curves": "report\\generated\\figures\\fig2_training_objective_curves.png",
+    "fig4_feature_importance_rf_proxy": "report\\generated\\figures\\fig4_feature_importance_rf_proxy.png",
+    "fig5_action_distribution_comparison": "report\\generated\\figures\\fig5_action_distribution_comparison.png",
+    "fig6_return_survival_relationship": "report\\generated\\figures\\fig6_return_survival_relationship.png",
+    "fig7_final_survival_comparison": "report\\generated\\figures\\fig7_final_survival_comparison.png"
+  },
+  "recommended_additional_metrics": [
+    "ESS (effective sample size) per policy",
+    "Off-support action rate",
+    "Binning-interval ablation (1/2/4/6/8h)",
+    "Subgroup policy value by lactate/shock severity"
+  ],
   "icu_sepsis": {
     "n_episodes": 50,
     "n_transitions": 359,

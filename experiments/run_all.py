@@ -50,12 +50,14 @@ def main() -> None:
     dataset_h5 = "outputs/data/mock_mdp_dataset.h5"
     ope_csv = "outputs/data/mock_ope_table.csv"
     wis_json = "outputs/ope/wis_summary.json"
+    summary_json = "outputs/data/mock_summary.json"
 
     if args.use_icu_sepsis:
         dataset_npz = "outputs/data/icu_sepsis_mdp_raw.npz"
         dataset_h5 = "outputs/data/icu_sepsis_mdp_dataset.h5"
         ope_csv = "outputs/data/icu_sepsis_ope_table.csv"
         wis_json = "outputs/ope/icu_sepsis_wis_summary.json"
+        summary_json = "outputs/data/icu_sepsis_summary.json"
         steps = [
             [
                 args.python,
@@ -84,6 +86,7 @@ def main() -> None:
         dataset_h5 = "outputs/data/mimic_fhir_mdp_dataset.h5"
         ope_csv = "outputs/data/mimic_fhir_ope_table.csv"
         wis_json = "outputs/ope/mimic_fhir_wis_summary.json"
+        summary_json = "outputs/data/mimic_fhir_summary.json"
         steps = [
             [
                 args.python,
@@ -112,6 +115,7 @@ def main() -> None:
         dataset_h5 = "outputs/data/mimic_bq_mdp_dataset.h5"
         ope_csv = "outputs/data/mimic_bq_ope_table.csv"
         wis_json = "outputs/ope/mimic_bq_wis_summary.json"
+        summary_json = "outputs/data/mimic_bq_summary.json"
         steps = [
             [
                 args.python,
@@ -361,6 +365,36 @@ def main() -> None:
         )
 
     steps.append(wis_step)
+
+    steps.append(
+        [
+            args.python,
+            "-m",
+            "src.ope.build_report_assets",
+            "--summary-json",
+            summary_json,
+            "--wis-json",
+            wis_json,
+            "--ope-csv",
+            ope_csv,
+            "--dataset-npz",
+            dataset_npz,
+            "--bc-metrics-json",
+            "outputs/models/bc/train_metrics.json",
+            "--cql-dir",
+            "outputs/models/cql",
+            "--bc-model",
+            "outputs/models/bc/bc_model.d3",
+            "--cql-model",
+            "outputs/models/cql/alpha_1/cql_model.d3",
+            "--out-json",
+            "report/generated/report_metrics.json",
+            "--out-table",
+            "report/generated/results_table.tex",
+            "--fig-dir",
+            "report/generated/figures",
+        ]
+    )
 
     for cmd in steps:
         _run(cmd, cwd=root)

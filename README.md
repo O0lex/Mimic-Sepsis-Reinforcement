@@ -59,6 +59,8 @@ cd finalProj
 python experiments/run_all.py
 ```
 
+This now auto-generates report artifacts (JSON, LaTeX table, and figures) under `report/generated/`.
+
 ## 3) Mini MIMIC-IV FHIR Demo Data Pipeline
 
 If you have the demo FHIR folder in `finalProj/data`, run:
@@ -117,6 +119,7 @@ Notes:
 
 - Vasopressors are normalized to NE-equivalent dose in extraction.
 - WIS can use BC-model behavior probabilities (`mu = P_BC(a_logged | s)`) via model-based mode.
+- End-to-end runs auto-generate paper-style metrics and figures in `report/generated/figures/`.
 
 ## 6) Files To Replace For Real MIMIC-IV Data
 
@@ -141,6 +144,15 @@ Generated under `finalProj/outputs`:
 - `outputs/data/mimic_bq_mdp_raw.npz`
 - `outputs/data/mimic_bq_mdp_dataset.h5`
 - `outputs/ope/mimic_bq_wis_summary.json`
+
+Generated under `finalProj/report/generated`:
+- `report/generated/report_metrics.json`
+- `report/generated/results_table.tex`
+- `report/generated/figures/fig2_training_objective_curves.png`
+- `report/generated/figures/fig4_feature_importance_rf_proxy.png`
+- `report/generated/figures/fig5_action_distribution_comparison.png`
+- `report/generated/figures/fig6_return_survival_relationship.png`
+- `report/generated/figures/fig7_final_survival_comparison.png`
 
 ## 8) Next Implementation Step
 

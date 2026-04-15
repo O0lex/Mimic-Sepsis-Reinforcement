@@ -75,40 +75,113 @@ Pipeline stages are script-based:
 
 The project includes compatibility handling for \texttt{d3rlpy} API differences (dataset loading and constructor signatures), enabling consistent execution across local environments.
 
-\section{Results on Public Demo FHIR Data}
-Using the current pipeline outputs:
+\section{Extended Results and Diagnostics (Draft)}
+This section is intentionally expanded and detailed. We prioritize methodological transparency and diagnostic completeness over page count at this draft stage; we will compress and condense in the final submission.
+
+\subsection{Primary FHIR Demo Cohort Outcomes}
+Current held-out FHIR demo outputs:
 \begin{itemize}[leftmargin=*]
   \item Cohort ICU encounters: 30
   \item Sepsis patients: 16
   \item Transitions: 1320
   \item State dimension: 16
+  \item Split counts (train/val/test transitions): 1020 / 126 / 174
+  \item Held-out evaluation episodes (test split): 4
 \end{itemize}
 
-OPE summary (WIS, 95\% CI):
+WIS summary (test split, 95\% CI):
 \begin{center}
 \begin{tabular}{lccc}
 \toprule
 Policy & Mean Return & 95\% CI Low & 95\% CI High \\
 \midrule
-Behavior (logged, test split) & -0.500 & -- & -- \\
-BC (proxy policy probs) & -0.315 & -1.000 & 0.587 \\
-CQL ($\alpha=1.0$, proxy policy probs) & -0.424 & -1.000 & 0.976 \\
+Behavior (logged) & -0.500 & -- & -- \\
+BC ($\mu$ estimated by BC model) & -0.503 & -1.000 & 0.500 \\
+CQL ($\alpha=1.0$) & -0.987 & -1.000 & -0.972 \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-Split diagnostics: train/val/test transitions are 1020/126/174 respectively, with only 4 held-out test episodes in this demo subset.
+\textbf{Interpretation}: for this tiny held-out slice (4 test episodes), uncertainty remains high and the estimator is sensitive. The goal at this stage is primarily to validate end-to-end correctness and diagnostic behavior, not to assert definitive clinical superiority.
 
-\textbf{Interpretation}: On this small demo subset, uncertainty is substantial and confidence intervals overlap heavily. Results are therefore inconclusive and mainly validate pipeline correctness rather than clinical superiority claims.
+\subsection{Training Dynamics (Figure 2 Analogue)}
+Figure~\ref{fig:train-curves} shows objective curves automatically exported from \texttt{d3rlpy} logs and collected by our report asset builder.
 
-\section{Open-Benchmark Validation: ICU-Sepsis}
-To reduce schedule risk while waiting for credentialed data, we added an open benchmark track using \texttt{Sepsis/ICU-Sepsis-v2}. This provides a reproducible, no-approval-required environment for validating algorithm and evaluation plumbing.
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.98\linewidth]{generated/figures/fig2_training_objective_curves.png}
+\caption{Training objective curves for BC and CQL variants. BC uses imitation loss; CQL panel overlays multiple $\alpha$ settings.}
+\label{fig:train-curves}
+\end{figure}
 
-Observed benchmark summary (current run):
+We observe stable BC convergence in the available runs and distinct optimization regimes across CQL conservative strengths. This is useful for diagnosing optimization stability and selecting candidate regularization ranges before full-cohort sweeps.
+
+\subsection{Feature Importance Proxy (Figure 4 Analogue)}
+Figure~\ref{fig:feat-importance} shows a Random Forest feature-importance proxy computed on terminal episode outcomes from the current extracted state vectors.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.84\linewidth]{generated/figures/fig4_feature_importance_rf_proxy.png}
+\caption{Top feature importance scores (proxy) from a Random Forest model over terminal outcomes. Feature labels are current lab-code identifiers from the extraction stage.}
+\label{fig:feat-importance}
+\end{figure}
+
+Top-ranked codes in the current run include 51301, 50868, 50970, and 50912. At this stage these are engineering-level indicators that the state representation is not degenerate; final clinical interpretation will require canonical variable mapping on full MIMIC-IV.
+
+\subsection{Action Distribution Diagnostics (Figure 5 Analogue)}
+Figure~\ref{fig:action-dist} compares action-distribution mass between logged clinician actions and learned policies on evaluation states.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.98\linewidth]{generated/figures/fig5_action_distribution_comparison.png}
+\caption{Action distribution comparison between logged clinician decisions and BC/CQL policy distributions.}
+\label{fig:action-dist}
+\end{figure}
+
+To quantify policy-style differences, we report Jensen-Shannon divergence:
+\begin{center}
+\begin{tabular}{lc}
+\toprule
+Distribution Pair & JS Divergence \\
+\midrule
+Clinician vs BC & 0.208 \\
+Clinician vs CQL & 0.014 \\
+BC vs CQL & 0.157 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+These diagnostics suggest CQL is currently closer to logged behavior than BC in this run, while BC and CQL remain meaningfully different from one another.
+
+\subsection{Value-Survival Relationship and Final Comparison (Figures 6 and 7 Analogues)}
+Figure~\ref{fig:return-survival} plots expected return against a bounded survival proxy (used here as a monotonic sanity-check transform during draft analysis).
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.74\linewidth]{generated/figures/fig6_return_survival_relationship.png}
+\caption{Relationship between policy expected return and survival proxy.}
+\label{fig:return-survival}
+\end{figure}
+
+Figure~\ref{fig:survival-compare} summarizes final policy-level survival-proxy comparisons with CI-derived uncertainty bars where available.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.74\linewidth]{generated/figures/fig7_final_survival_comparison.png}
+\caption{Final policy comparison using survival-proxy transformation from expected returns.}
+\label{fig:survival-compare}
+\end{figure}
+
+\textbf{Important caveat}: the survival-proxy mapping used in this draft is a monotonic transformation of estimated value and therefore cannot be interpreted as calibrated clinical survival probability. It is included as a consistency diagnostic only.
+
+\subsection{Open Benchmark Validation: ICU-Sepsis}
+To reduce execution risk while scaling to credentialed MIMIC-IV, we maintain an open benchmark track using \texttt{Sepsis/ICU-Sepsis-v2}.
+
+Current benchmark summary:
 \begin{itemize}[leftmargin=*]
   \item Episodes: 50
   \item Transitions: 359
-  \item State dimension: 716 (discrete-state one-hot encoding)
+  \item State dimension: 716 (one-hot encoding of discrete environment state)
   \item Test split episodes: 8
 \end{itemize}
 
@@ -119,13 +192,13 @@ WIS summary on ICU-Sepsis test split:
 Policy & Mean Return & 95\% CI Low & 95\% CI High \\
 \midrule
 Behavior (logged) & 0.750 & -- & -- \\
-BC (proxy policy probs) & 0.772 & 0.429 & 1.000 \\
-CQL ($\alpha=1.0$, proxy policy probs) & 0.786 & 0.498 & 1.000 \\
+BC & 0.772 & 0.429 & 1.000 \\
+CQL ($\alpha=1.0$) & 0.786 & 0.498 & 1.000 \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\textbf{Interpretation}: ICU-Sepsis provides a stronger algorithmic smoke test than tiny FHIR subsets and helps verify that BC/CQL/OPE components are functioning consistently in a controlled benchmark setting. However, benchmark gains do not by themselves establish clinical validity on real MIMIC-IV.
+\textbf{Interpretation}: this benchmark confirms algorithmic plumbing and improves confidence in reproducibility, but does not substitute for full-scale clinical validation on credentialed MIMIC-IV.
 
 \section{Limitations and Validity Threats}
 \begin{itemize}[leftmargin=*]

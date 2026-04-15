@@ -347,12 +347,18 @@ It writes:
 
 - `report/generated/report_metrics.json`
 - `report/generated/results_table.tex`
+- `report/generated/figures/fig2_training_objective_curves.png`
+- `report/generated/figures/fig4_feature_importance_rf_proxy.png`
+- `report/generated/figures/fig5_action_distribution_comparison.png`
+- `report/generated/figures/fig6_return_survival_relationship.png`
+- `report/generated/figures/fig7_final_survival_comparison.png`
 
 Purpose:
 
 - keep the report reproducible
 - avoid manual copying of numbers into LaTeX
 - maintain one source of truth for results
+- generate paper-style figures directly from training/evaluation outputs
 
 ### `report/report.tex`
 
@@ -387,6 +393,8 @@ It performs:
 3. BC training
 4. CQL training with multiple alpha values
 5. WIS evaluation
+
+6. Report asset generation (JSON + LaTeX table + figures)
 
 This makes it the best command for end-to-end smoke tests and reproducibility.
 

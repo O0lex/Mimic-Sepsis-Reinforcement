@@ -52,6 +52,18 @@ def _fit_algo(algo, dataset, n_steps: int, eval_interval: int) -> None:
     raise RuntimeError("Unable to call algo.fit with known d3rlpy signatures.")
 
 
+def _find_new_log_dir(before: set[Path], pattern: str) -> Path | None:
+    log_root = Path("d3rlpy_logs")
+    if not log_root.exists():
+        return None
+    after = set(log_root.glob(pattern))
+    created = sorted((after - before), key=lambda p: p.stat().st_mtime)
+    if created:
+        return created[-1]
+    candidates = sorted(after, key=lambda p: p.stat().st_mtime)
+    return candidates[-1] if candidates else None
+
+
 def _load_dataset(h5_path: Path, npz_path: Path):
     from d3rlpy.dataset import InfiniteBuffer, MDPDataset, ReplayBuffer
 
@@ -94,7 +106,10 @@ def main() -> None:
     config, used_kwargs = _build_cql_config(d3rlpy, batch_size=args.batch_size, alpha=args.alpha)
     algo = config.create(device=args.device)
 
+    log_root = Path("d3rlpy_logs")
+    before_logs = set(log_root.glob("DiscreteCQL_*")) if log_root.exists() else set()
     _fit_algo(algo, dataset, n_steps=args.n_steps, eval_interval=args.eval_interval)
+    log_dir = _find_new_log_dir(before=before_logs, pattern="DiscreteCQL_*")
 
     run_dir = args.out_dir / f"alpha_{args.alpha:g}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -112,6 +127,7 @@ def main() -> None:
         "dataset_h5": str(args.dataset_h5),
         "dataset_npz": str(args.dataset_npz),
         "model_path": str(model_path),
+        "log_dir": str(log_dir) if log_dir is not None else None,
     }
     write_json(run_dir / "train_metrics.json", metrics)
     print("CQL training complete")

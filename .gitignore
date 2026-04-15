@@ -42,6 +42,10 @@ data/mimic-iv-clinical-database-*/
 data/mimic-iv-*/
 data/private*/
 
+
+*.parquet
+*.npz
+
 # LaTeX auxiliary files
 *.aux
 *.fdb_latexmk
