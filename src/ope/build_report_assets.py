@@ -1,17 +1,15 @@
 from __future__ import annotations
 
 import argparse
-import math
+import json
 from pathlib import Path
 
-import json
+import matplotlib
 import numpy as np
 import pandas as pd
-import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
 from sklearn.ensemble import RandomForestClassifier
 
 from src.common.io import ensure_parent, write_json
@@ -39,6 +37,16 @@ def _parse_args() -> argparse.Namespace:
 
 def _read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _parse_alpha_from_path(path: Path) -> float:
+    token = path.parent.name
+    if token.startswith("alpha_"):
+        try:
+            return float(token.replace("alpha_", ""))
+        except ValueError:
+            return 0.0
+    return 0.0
 
 
 def _find_latest_log_dir(pattern: str) -> Path | None:
@@ -176,6 +184,221 @@ def _js_divergence(p: np.ndarray, q: np.ndarray) -> float:
     return float(0.5 * (kl_pm + kl_qm))
 
 
+def _wis_from_logged_probs(df: pd.DataFrame, policy_prob_col: str, clip: float) -> float:
+    grouped = df.groupby("episode_id", sort=False)
+    episode_weights = []
+    episode_returns = []
+
+    for _, ep in grouped:
+        pi = ep[policy_prob_col].to_numpy(dtype=np.float64)
+        mu = ep["mu_prob"].to_numpy(dtype=np.float64)
+        rew = ep["reward"].to_numpy(dtype=np.float64)
+
+        # Log-space product for numerical stability
+        log_ratios = np.log(np.clip(pi, 1e-12, 1.0)) - np.log(np.clip(mu, 1e-8, 1.0))
+        cum_weight = np.exp(np.sum(log_ratios))
+        
+        # Cumulative clipping as per latest correctness standards
+        if clip is not None:
+            cum_weight = np.clip(cum_weight, 0.0, float(clip))
+
+        episode_weights.append(float(cum_weight))
+        episode_returns.append(float(np.sum(rew)))
+
+    weights = np.asarray(episode_weights, dtype=np.float64)
+    returns = np.asarray(episode_returns, dtype=np.float64)
+    denom = float(np.sum(weights))
+    return float(np.sum(weights * returns) / denom) if denom > 0.0 else 0.0
+
+
+def _plot_clinical_heatmaps(
+    clinician_dist: np.ndarray,
+    bc_dist: np.ndarray,
+    cql_dist: np.ndarray,
+    fig_dir: Path,
+) -> dict[str, str]:
+    # For this project the action mapping is fixed to 5x5 fluid/vasopressor bins.
+    if clinician_dist.shape[0] != 25 or bc_dist.shape[0] != 25 or cql_dist.shape[0] != 25:
+        return {}
+
+    labels = ["None", "Low", "Med", "High", "Max"]
+    policies = [
+        (clinician_dist.reshape(5, 5), "Clinician Policy", "fig10a_heatmap_clinician.png"),
+        (bc_dist.reshape(5, 5), "BC Policy", "fig10b_heatmap_bc.png"),
+        (cql_dist.reshape(5, 5), "CQL Policy", "fig10c_heatmap_cql.png"),
+    ]
+    outputs: dict[str, str] = {}
+
+    for grid, title, fname in policies:
+        fig, ax = plt.subplots(figsize=(5.2, 4.2))
+        im = ax.imshow(grid, cmap="YlGnBu", origin="lower", aspect="auto")
+        ax.set_title(title, fontsize=12, pad=10)
+        ax.set_xticks(np.arange(5))
+        ax.set_yticks(np.arange(5))
+        ax.set_xticklabels(labels)
+        ax.set_yticklabels(labels)
+        ax.set_xlabel("Vasopressor Dose", fontsize=10)
+        ax.set_ylabel("IV Fluid Dose", fontsize=10)
+        ax.spines[["top", "right"]].set_visible(False)
+        cbar = plt.colorbar(im)
+        cbar.set_label("Frequency")
+        fig.tight_layout()
+        out_path = fig_dir / fname
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        outputs[fname.replace(".png", "")] = str(out_path)
+
+    return outputs
+
+
+def _plot_mortality_vs_deviation(
+    logged_actions: np.ndarray,
+    cql_actions: np.ndarray,
+    rewards: np.ndarray,
+    episode_ids: np.ndarray,
+    fig_dir: Path,
+) -> tuple[Path | None, dict[str, float]]:
+    if not (
+        logged_actions.size
+        and cql_actions.size
+        and rewards.size
+        and episode_ids.size
+        and logged_actions.shape[0] == cql_actions.shape[0] == rewards.shape[0] == episode_ids.shape[0]
+    ):
+        return None, {}
+
+    deviation = np.abs(logged_actions.astype(np.int64) - cql_actions.astype(np.int64)).astype(np.float64)
+    frame = pd.DataFrame(
+        {
+            "episode_id": episode_ids.astype(np.int64),
+            "deviation": deviation,
+            "reward": rewards.astype(np.float64),
+        }
+    )
+
+    ep = frame.groupby("episode_id", sort=False).agg(
+        mean_deviation=("deviation", "mean"),
+        episode_return=("reward", "sum"),
+    )
+    ep["mortality"] = (ep["episode_return"] < 0.0).astype(np.float64)
+    if ep.shape[0] < 10 or np.unique(ep["mean_deviation"].to_numpy()).shape[0] < 2:
+        return None, {}
+
+    q = min(5, int(np.unique(ep["mean_deviation"].to_numpy()).shape[0]))
+    bins = pd.qcut(ep["mean_deviation"], q=q, duplicates="drop")
+    binned = (
+        ep.assign(bin=bins)
+        .groupby("bin", observed=False)
+        .agg(
+            mean_deviation=("mean_deviation", "mean"),
+            mortality_rate=("mortality", "mean"),
+            n=("mortality", "size"),
+        )
+        .reset_index(drop=True)
+    )
+
+    fig, ax = plt.subplots(figsize=(6.8, 4.4))
+    ax.plot(
+        binned["mean_deviation"],
+        binned["mortality_rate"],
+        marker="o",
+        color="black",
+        linewidth=1.8,
+        markersize=5,
+    )
+    ax.fill_between(
+        binned["mean_deviation"],
+        0.0,
+        binned["mortality_rate"],
+        color="0.2",
+        alpha=0.12,
+    )
+    ax.set_title("Mortality vs Deviation from CQL Policy")
+    ax.set_xlabel("Mean |Clinician Action - CQL Action| per Episode")
+    ax.set_ylabel("Mortality Rate")
+    ax.set_ylim(0.0, 1.0)
+    ax.grid(axis="y", alpha=0.3)
+    ax.spines[["top", "right"]].set_visible(False)
+    fig.tight_layout()
+    out_path = fig_dir / "fig8_mortality_deviation.png"
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+    corr = float(np.corrcoef(binned["mean_deviation"], binned["mortality_rate"])[0, 1])
+    return out_path, {
+        "mortality_deviation_corr": corr,
+        "n_bins": float(binned.shape[0]),
+    }
+
+
+def _build_alpha_sensitivity(
+    args: argparse.Namespace,
+    dataset,
+    observations: np.ndarray,
+    df_eval: pd.DataFrame,
+    actions: np.ndarray,
+    behavior_v: float,
+    wis_clip: float,
+) -> tuple[Path | None, list[dict[str, float]]]:
+    alpha_points: list[dict[str, float]] = []
+    model_paths = sorted(args.cql_dir.glob("alpha_*/cql_model.d3"), key=_parse_alpha_from_path)
+    if not model_paths:
+        return None, alpha_points
+
+    for mpath in model_paths:
+        alpha = _parse_alpha_from_path(mpath)
+        try:
+            probs_all = _predict_cql_probs_all_actions(
+                observations=observations,
+                dataset=dataset,
+                cql_model=mpath,
+                temperature=args.cql_temperature,
+                batch_size=args.prob_batch_size,
+            )
+        except Exception as exc:
+            print(f"Warning: skipping alpha={alpha:g} sensitivity point due to model eval error: {exc}")
+            continue
+        sel = np.clip(actions.astype(np.int64), 0, probs_all.shape[1] - 1)
+        logged_probs = probs_all[np.arange(probs_all.shape[0]), sel]
+
+        df_tmp = df_eval.copy()
+        n = min(df_tmp.shape[0], logged_probs.shape[0])
+        if n <= 0:
+            continue
+        if n != df_tmp.shape[0]:
+            print(
+                "Warning: alpha sensitivity row mismatch; "
+                f"using first {n} rows (df={df_tmp.shape[0]}, probs={logged_probs.shape[0]})."
+            )
+        df_tmp = df_tmp.iloc[:n].copy()
+        df_tmp["alpha_eval_prob"] = logged_probs[:n]
+        alpha_wis = _wis_from_logged_probs(df_tmp, policy_prob_col="alpha_eval_prob", clip=wis_clip)
+        alpha_points.append({"alpha": float(alpha), "wis_return": float(alpha_wis)})
+
+    if not alpha_points:
+        return None, alpha_points
+
+    alpha_points = sorted(alpha_points, key=lambda x: x["alpha"])
+    x = [p["alpha"] for p in alpha_points]
+    y = [p["wis_return"] for p in alpha_points]
+
+    fig, ax = plt.subplots(figsize=(6.6, 4.2))
+    ax.plot(x, y, marker="o", linestyle="-", color="black", linewidth=1.8, label="CQL")
+    ax.axhline(y=behavior_v, color="0.35", linestyle="--", linewidth=1.4, label="Clinician baseline")
+    ax.set_title("Hyperparameter Sensitivity (CQL Alpha)")
+    ax.set_xlabel("Conservative Penalty (Alpha)")
+    ax.set_ylabel("WIS Return")
+    ax.grid(alpha=0.3)
+    ax.legend(frameon=False)
+    ax.spines[["top", "right"]].set_visible(False)
+    fig.tight_layout()
+    out_path = args.fig_dir / "fig9_alpha_sensitivity.png"
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+    return out_path, alpha_points
+
+
 def main() -> None:
     args = _parse_args()
     if not args.summary_json.exists():
@@ -188,13 +411,35 @@ def main() -> None:
 
     args.fig_dir.mkdir(parents=True, exist_ok=True)
 
+    # Baseline values are needed by multiple figures.
+    behavior_v = float(wis.get("behavior_episode_return", 0.0))
+    bc_v = float(wis.get("bc_wis_mean", 0.0))
+    cql_v = float(wis.get("cql_wis_mean", 0.0))
+    behavior_s = _policy_survival_proxy(behavior_v)
+    bc_s = _policy_survival_proxy(bc_v)
+    cql_s = _policy_survival_proxy(cql_v)
+
+    # Reward verification metadata for reporting fidelity.
+    reward_unique_values: list[float] = []
+    reward_is_terminal_binary = False
+
+    dataset = None
+    arrays = None
+    if args.dataset_npz.exists():
+        dataset, arrays = _build_d3_dataset(args.dataset_npz)
+        reward_unique_values = [float(x) for x in np.unique(arrays["rewards"]).tolist()]
+        reward_is_terminal_binary = set(np.round(np.asarray(reward_unique_values), 6).tolist()).issubset({-1.0, 0.0, 1.0})
+
     # Plot 1: Training objective curves (paper Figure 2 analogue).
     bc_metrics = _read_json(args.bc_metrics_json) if args.bc_metrics_json.exists() else None
     bc_log_dir = _resolve_log_dir(metrics=bc_metrics, pattern="DiscreteBC_*")
 
     cql_run_metrics: list[tuple[float, dict]] = []
     if args.cql_dir.exists():
-        for mpath in sorted(args.cql_dir.glob("alpha_*/train_metrics.json")):
+        metrics_paths = sorted(args.cql_dir.glob("alpha_*/train_metrics.json"))
+        if not metrics_paths:
+            metrics_paths = sorted(args.cql_dir.glob("alpha_**/**/train_metrics.json"))
+        for mpath in metrics_paths:
             m = _read_json(mpath)
             cql_run_metrics.append((float(m.get("alpha_requested", 0.0)), m))
     cql_run_metrics.sort(key=lambda x: x[0])
@@ -254,70 +499,142 @@ def main() -> None:
 
     # Plot 2: Action distribution comparison (paper Figure 5 analogue).
     action_dist_fig = None
+    mortality_deviation_fig = None
+    alpha_sensitivity_fig = None
+    heatmap_figs: dict[str, str] = {}
     action_metrics: dict[str, float] = {}
+    alpha_sensitivity_points: list[dict[str, float]] = []
+    model_eval_warning: str | None = None
     bc_action_dist = None
     cql_action_dist = None
     clinician_action_dist = None
+    cql_greedy_actions = None
 
-    if args.dataset_npz.exists() and args.bc_model.exists() and args.cql_model.exists():
-        dataset, arrays = _build_d3_dataset(args.dataset_npz)
-        actions = arrays["actions"].astype(np.int64)
-        n_actions = int(actions.max() + 1) if actions.size else 1
+    if arrays is not None and args.bc_model.exists() and args.cql_model.exists():
+        try:
+            actions = arrays["actions"].astype(np.int64)
+            n_actions = int(actions.max() + 1) if actions.size else 1
 
-        clinician_action_dist = np.bincount(actions, minlength=n_actions).astype(np.float64)
-        clinician_action_dist /= np.clip(np.sum(clinician_action_dist), 1e-12, None)
+            clinician_action_dist = np.bincount(actions, minlength=n_actions).astype(np.float64)
+            clinician_action_dist /= np.clip(np.sum(clinician_action_dist), 1e-12, None)
 
-        observations = arrays["observations"]
-        bc_probs = _predict_bc_probs_all_actions(
-            observations=observations,
-            dataset=dataset,
-            bc_model=args.bc_model,
-            batch_size=args.prob_batch_size,
-        )
-        cql_probs = _predict_cql_probs_all_actions(
-            observations=observations,
-            dataset=dataset,
-            cql_model=args.cql_model,
-            temperature=args.cql_temperature,
-            batch_size=args.prob_batch_size,
-        )
+            observations = arrays["observations"]
+            bc_probs = _predict_bc_probs_all_actions(
+                observations=observations,
+                dataset=dataset,
+                bc_model=args.bc_model,
+                batch_size=args.prob_batch_size,
+            )
+            cql_probs = _predict_cql_probs_all_actions(
+                observations=observations,
+                dataset=dataset,
+                cql_model=args.cql_model,
+                temperature=args.cql_temperature,
+                batch_size=args.prob_batch_size,
+            )
 
-        bc_action_dist = np.mean(bc_probs, axis=0)
-        cql_action_dist = np.mean(cql_probs, axis=0)
+            bc_action_dist = np.mean(bc_probs, axis=0)
+            cql_action_dist = np.mean(cql_probs, axis=0)
+            cql_greedy_actions = np.argmax(cql_probs, axis=1).astype(np.int64)
 
-        # Align action-space sizes if model/action artifacts differ.
-        max_a = max(clinician_action_dist.shape[0], bc_action_dist.shape[0], cql_action_dist.shape[0])
-        clinician_action_dist = np.pad(clinician_action_dist, (0, max_a - clinician_action_dist.shape[0]))
-        bc_action_dist = np.pad(bc_action_dist, (0, max_a - bc_action_dist.shape[0]))
-        cql_action_dist = np.pad(cql_action_dist, (0, max_a - cql_action_dist.shape[0]))
+            # Align action-space sizes if model/action artifacts differ.
+            max_a = max(clinician_action_dist.shape[0], bc_action_dist.shape[0], cql_action_dist.shape[0])
+            clinician_action_dist = np.pad(clinician_action_dist, (0, max_a - clinician_action_dist.shape[0]))
+            bc_action_dist = np.pad(bc_action_dist, (0, max_a - bc_action_dist.shape[0]))
+            cql_action_dist = np.pad(cql_action_dist, (0, max_a - cql_action_dist.shape[0]))
 
-        x = np.arange(max_a)
-        width = 0.28
-        fig, ax = plt.subplots(figsize=(max(10, max_a * 0.35), 4.8))
-        ax.bar(x - width, clinician_action_dist, width=width, label="Clinician (logged)", alpha=0.9)
-        ax.bar(x, bc_action_dist, width=width, label="BC policy", alpha=0.85)
-        ax.bar(x + width, cql_action_dist, width=width, label="CQL policy", alpha=0.85)
-        ax.set_title("Action Distribution on Evaluation States")
-        ax.set_xlabel("Discrete Action ID")
-        ax.set_ylabel("Probability")
-        ax.grid(axis="y", alpha=0.3)
-        ax.legend(frameon=False)
-        fig.tight_layout()
-        action_dist_fig = args.fig_dir / "fig5_action_distribution_comparison.png"
-        fig.savefig(action_dist_fig, dpi=160)
-        plt.close(fig)
+            x = np.arange(max_a)
+            width = 0.28
+            fig, ax = plt.subplots(figsize=(max(10, max_a * 0.35), 4.8))
+            ax.bar(x - width, clinician_action_dist, width=width, label="Clinician (logged)", alpha=0.9)
+            ax.bar(x, bc_action_dist, width=width, label="BC policy", alpha=0.85)
+            ax.bar(x + width, cql_action_dist, width=width, label="CQL policy", alpha=0.85)
+            ax.set_title("Action Distribution on Evaluation States")
+            ax.set_xlabel("Discrete Action ID")
+            ax.set_ylabel("Probability")
+            ax.grid(axis="y", alpha=0.3)
+            ax.legend(frameon=False)
+            fig.tight_layout()
+            action_dist_fig = args.fig_dir / "fig5_action_distribution_comparison.png"
+            fig.savefig(action_dist_fig, dpi=160)
+            plt.close(fig)
 
-        action_metrics = {
-            "js_clinician_vs_bc": _js_divergence(clinician_action_dist, bc_action_dist),
-            "js_clinician_vs_cql": _js_divergence(clinician_action_dist, cql_action_dist),
-            "js_bc_vs_cql": _js_divergence(bc_action_dist, cql_action_dist),
-        }
+            action_metrics = {
+                "js_clinician_vs_bc": _js_divergence(clinician_action_dist, bc_action_dist),
+                "js_clinician_vs_cql": _js_divergence(clinician_action_dist, cql_action_dist),
+                "js_bc_vs_cql": _js_divergence(bc_action_dist, cql_action_dist),
+            }
+
+            heatmap_figs = _plot_clinical_heatmaps(
+                clinician_dist=clinician_action_dist,
+                bc_dist=bc_action_dist,
+                cql_dist=cql_action_dist,
+                fig_dir=args.fig_dir,
+            )
+
+            if args.ope_csv.exists():
+                ope_df_full = pd.read_csv(args.ope_csv)
+                if ope_df_full.shape[0] == arrays["actions"].shape[0]:
+                    eval_split = wis.get("eval_split", "all")
+                    if "split" in ope_df_full.columns and eval_split != "all":
+                        mask = ope_df_full["split"].astype(str) == str(eval_split)
+                    else:
+                        mask = np.ones((ope_df_full.shape[0],), dtype=bool)
+
+                    actions_logged = (
+                        ope_df_full["action"].to_numpy(dtype=np.int64)
+                        if "action" in ope_df_full.columns
+                        else arrays["actions"].astype(np.int64)
+                    )
+                    rewards_eval = (
+                        ope_df_full["reward"].to_numpy(dtype=np.float64)
+                        if "reward" in ope_df_full.columns
+                        else arrays["rewards"].astype(np.float64)
+                    )
+                    episode_ids_eval = (
+                        ope_df_full["episode_id"].to_numpy(dtype=np.int64)
+                        if "episode_id" in ope_df_full.columns
+                        else arrays["episode_ids"].astype(np.int64)
+                    )
+
+                    mortality_deviation_fig, mortality_metrics = _plot_mortality_vs_deviation(
+                        logged_actions=actions_logged[mask],
+                        cql_actions=cql_greedy_actions[mask],
+                        rewards=rewards_eval[mask],
+                        episode_ids=episode_ids_eval[mask],
+                        fig_dir=args.fig_dir,
+                    )
+                    action_metrics.update(mortality_metrics)
+
+                    if set(["episode_id", "reward", "mu_prob"]).issubset(set(ope_df_full.columns)):
+                        df_alpha = ope_df_full.copy()
+                        if "split" in df_alpha.columns and eval_split != "all":
+                            df_alpha = df_alpha[df_alpha["split"].astype(str) == str(eval_split)].copy()
+                            alpha_mask = mask
+                        else:
+                            alpha_mask = np.ones((ope_df_full.shape[0],), dtype=bool)
+
+                        wis_clip = float(wis.get("clip", 20.0))
+                        alpha_sensitivity_fig, alpha_sensitivity_points = _build_alpha_sensitivity(
+                            args=args,
+                            dataset=dataset,
+                            observations=arrays["observations"][alpha_mask],
+                            df_eval=df_alpha,
+                            actions=actions_logged[alpha_mask],
+                            behavior_v=behavior_v,
+                            wis_clip=wis_clip,
+                        )
+        except Exception as exc:
+            model_eval_warning = str(exc)
+            print(
+                "Warning: skipping model-dependent figures (fig5/fig8/fig9/fig10*) due to "
+                f"model-dataset mismatch or load error: {exc}"
+            )
 
     # Plot 3: Feature importance (paper Figure 4 analogue) using RF on terminal outcome.
     feat_importance_fig = None
     top_features: list[dict[str, float]] = []
-    if args.dataset_npz.exists():
-        arrays = np.load(args.dataset_npz)
+    if arrays is not None:
         observations = arrays["observations"]
         episode_ids = arrays["episode_ids"].astype(np.int64)
         rewards = arrays["rewards"].astype(np.float64)
@@ -362,13 +679,6 @@ def main() -> None:
     # Plot 4/5: Return-survival relationship and final survival comparison (paper Figure 6/7 analogues).
     return_survival_fig = None
     survival_comparison_fig = None
-    behavior_v = float(wis.get("behavior_episode_return", 0.0))
-    bc_v = float(wis.get("bc_wis_mean", 0.0))
-    cql_v = float(wis.get("cql_wis_mean", 0.0))
-
-    behavior_s = _policy_survival_proxy(behavior_v)
-    bc_s = _policy_survival_proxy(bc_v)
-    cql_s = _policy_survival_proxy(cql_v)
 
     xs = np.asarray([behavior_v, bc_v, cql_v], dtype=np.float64)
     ys = np.asarray([behavior_s, bc_s, cql_s], dtype=np.float64)
@@ -436,11 +746,25 @@ def main() -> None:
         "cql_wis_ci95": wis.get("cql_wis_ci95"),
         "eval_split": wis.get("eval_split", "all"),
         "n_episodes_eval": wis.get("n_episodes_eval"),
+        "reward_unique_values": reward_unique_values,
+        "reward_is_terminal_binary": reward_is_terminal_binary,
+        "survival_label_is_rigorous": reward_is_terminal_binary,
+        "action_mapping": {
+            "formula": "action = fluid_bin * 5 + vaso_bin",
+            "decode": {
+                "fluid_bin": "action // 5",
+                "vaso_bin": "action % 5",
+            },
+            "fluid_bins_ml": ["0", "1-50", "51-500", "501-1000", ">1000"],
+            "vaso_bins_mcgkgmin": ["0", "0.001-0.05", "0.051-0.20", "0.201-0.45", ">0.45"],
+        },
         "behavior_survival_proxy": behavior_s,
         "bc_survival_proxy": bc_s,
         "cql_survival_proxy": cql_s,
         "value_survival_corr": corr,
         "action_distribution_divergence": action_metrics,
+        "model_eval_warning": model_eval_warning,
+        "alpha_sensitivity_points": alpha_sensitivity_points,
         "top_features_rf_proxy": top_features,
         "figures": {
             "fig2_training_objective_curves": str(training_curves_fig) if training_curves_fig is not None else None,
@@ -448,6 +772,9 @@ def main() -> None:
             "fig5_action_distribution_comparison": str(action_dist_fig) if action_dist_fig is not None else None,
             "fig6_return_survival_relationship": str(return_survival_fig) if return_survival_fig is not None else None,
             "fig7_final_survival_comparison": str(survival_comparison_fig) if survival_comparison_fig is not None else None,
+            "fig8_mortality_deviation": str(mortality_deviation_fig) if mortality_deviation_fig is not None else None,
+            "fig9_alpha_sensitivity": str(alpha_sensitivity_fig) if alpha_sensitivity_fig is not None else None,
+            **heatmap_figs,
         },
         "recommended_additional_metrics": [
             "ESS (effective sample size) per policy",

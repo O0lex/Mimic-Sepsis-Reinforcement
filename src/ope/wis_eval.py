@@ -91,7 +91,8 @@ def _predict_logged_probs_bc(
         sel = np.clip(action_idx[start:end], 0, max_action)
         logged_probs[start:end] = probs[np.arange(probs.shape[0]), sel]
 
-    return np.clip(logged_probs, 1e-8, 1.0)
+    # CHANGED: Increased floor from 1e-8 to 1e-4 to reduce variance
+    return np.clip(logged_probs, 1e-4, 1.0)
 
 
 def _predict_logged_probs_cql(
@@ -146,36 +147,56 @@ def build_episode_arrays(df: pd.DataFrame, policy_col: str, clip: float | None =
         mu = ep["mu_prob"].to_numpy(dtype=np.float64)
         rewards = ep["reward"].to_numpy(dtype=np.float64)
 
-        ratio = pi / np.clip(mu, 1e-8, None)
+        # Calculate importance ratios
+        # Using a floor of 1e-8 for mu here is fine because of cumulative clipping
+        ratios = pi / np.clip(mu, 1e-8, None)
+        
+        # Cumulative product of ratios for the whole episode
+        log_ratios = np.log(pi) - np.log(np.clip(mu, 1e-8, None))
+        cum_weight = np.exp(np.sum(log_ratios))
+        
+        # CHANGED: Clip the total episode weight instead of individual steps
         if clip is not None:
-            ratio = np.clip(ratio, 0.0, clip)
+            cum_weight = np.clip(cum_weight, 0.0, clip)
 
-        episode_weights.append(float(np.prod(ratio)))
+        episode_weights.append(float(cum_weight))
         episode_returns.append(float(np.sum(rewards)))
 
     return np.asarray(episode_weights, dtype=np.float64), np.asarray(episode_returns, dtype=np.float64)
 
 
-def wis_from_episode_arrays(weights: np.ndarray, returns: np.ndarray) -> float:
+def wis_from_episode_arrays(weights: np.ndarray, returns: np.ndarray) -> tuple[float, float]:
     denom = float(np.sum(weights))
     if denom <= 0.0:
-        return 0.0
-    return float(np.sum(weights * returns) / denom)
+        return 0.0, 0.0
+    
+    # Calculate WIS Mean
+    estimate = float(np.sum(weights * returns) / denom)
+    
+    # Calculate ESS: (sum(w)^2) / sum(w^2)
+    ess = float((denom**2) / np.sum(weights**2))
+    
+    return estimate, ess
 
 
-def bootstrap_ci(df: pd.DataFrame, policy_col: str, n_boot: int, seed: int, clip: float | None = None) -> tuple[float, float, float]:
+def bootstrap_ci(df: pd.DataFrame, policy_col: str, n_boot: int, seed: int, clip: float | None = None) -> tuple[float, float, float, float]:
     set_seed(seed)
     episode_weights, episode_returns = build_episode_arrays(df, policy_col=policy_col, clip=clip)
     n_episodes = episode_weights.shape[0]
     estimates = np.empty(n_boot, dtype=np.float64)
+    
+    # Calculate global ESS for the whole test set
+    _, global_ess = wis_from_episode_arrays(episode_weights, episode_returns)
 
     for i in range(n_boot):
         sampled_idx = np.random.randint(0, n_episodes, size=n_episodes)
         w = episode_weights[sampled_idx]
         g = episode_returns[sampled_idx]
-        estimates[i] = wis_from_episode_arrays(w, g)
+        # Only take the first element (the WIS estimate) for the CI distribution
+        val, _ = wis_from_episode_arrays(w, g)
+        estimates[i] = val
 
-    return float(np.mean(estimates)), float(np.percentile(estimates, 2.5)), float(np.percentile(estimates, 97.5))
+    return float(np.mean(estimates)), float(np.percentile(estimates, 2.5)), float(np.percentile(estimates, 97.5)), global_ess
 
 
 def _parse_args() -> argparse.Namespace:
@@ -184,7 +205,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--out-json", type=Path, default=Path("outputs/ope/wis_summary.json"))
     parser.add_argument("--out-csv", type=Path, default=None)
     parser.add_argument("--clip", type=float, default=20.0)
-    parser.add_argument("--n-boot", type=int, default=200)
+    parser.add_argument("--n-boot", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--eval-split", type=str, default="test")
     parser.add_argument("--mu-source", type=str, choices=["csv", "bc_model"], default="csv")
@@ -262,17 +283,18 @@ def main() -> None:
 
     behavior_return = float(df.groupby("episode_id", sort=False)["reward"].sum().mean())
 
-    bc_mean, bc_lo, bc_hi = bootstrap_ci(df, policy_col="bc_prob", n_boot=args.n_boot, seed=args.seed, clip=args.clip)
-    cql_mean, cql_lo, cql_hi = bootstrap_ci(
-        df, policy_col="cql_prob", n_boot=args.n_boot, seed=args.seed + 1, clip=args.clip
-    )
+    bc_mean, bc_lo, bc_hi, bc_ess = bootstrap_ci(df, policy_col="bc_prob", n_boot=args.n_boot, seed=args.seed, clip=args.clip)
+    cql_mean, cql_lo, cql_hi, cql_ess = bootstrap_ci(df, policy_col="cql_prob", n_boot=args.n_boot, seed=args.seed + 1, clip=args.clip)
 
+    # 2. Build the final summary (Include ESS here so it's saved!)
     summary = {
         "behavior_episode_return": behavior_return,
         "bc_wis_mean": bc_mean,
         "bc_wis_ci95": [bc_lo, bc_hi],
+        "bc_ess": bc_ess,  # Added for correctness
         "cql_wis_mean": cql_mean,
         "cql_wis_ci95": [cql_lo, cql_hi],
+        "cql_ess": cql_ess,  # Added for correctness
         "clip": args.clip,
         "n_boot": args.n_boot,
         "eval_split": split_used,
