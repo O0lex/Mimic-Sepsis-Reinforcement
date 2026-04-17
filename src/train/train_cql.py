@@ -38,30 +38,65 @@ def _build_cql_config(d3rlpy_module, batch_size: int, alpha: float):
     raise RuntimeError("Could not create DiscreteCQLConfig with known parameter names.")
 
 
-def _fit_algo(algo, dataset, n_steps: int, eval_interval: int) -> None:
+def _fit_algo(
+    algo,
+    dataset,
+    n_steps: int,
+    eval_interval: int,
+    experiment_name: str,
+    log_root: Path,
+) -> dict:
     fit_variants = [
+        {
+            "dataset": dataset,
+            "n_steps": n_steps,
+            "n_steps_per_epoch": max(1, eval_interval),
+            "show_progress": True,
+            "experiment_name": experiment_name,
+            "with_timestamp": False,
+            "logdir": str(log_root),
+        },
+        {
+            "dataset": dataset,
+            "n_epochs": max(1, n_steps // max(1, eval_interval)),
+            "show_progress": True,
+            "experiment_name": experiment_name,
+            "with_timestamp": False,
+            "logdir": str(log_root),
+        },
         {"dataset": dataset, "n_steps": n_steps, "n_steps_per_epoch": max(1, eval_interval), "show_progress": True},
         {"dataset": dataset, "n_epochs": max(1, n_steps // max(1, eval_interval)), "show_progress": True},
     ]
     for kwargs in fit_variants:
         try:
             algo.fit(**kwargs)
-            return
+            return kwargs
         except TypeError:
             continue
     raise RuntimeError("Unable to call algo.fit with known d3rlpy signatures.")
 
 
-def _find_new_log_dir(before: set[Path], pattern: str) -> Path | None:
-    log_root = Path("d3rlpy_logs")
+def _find_new_log_dir(before: set[Path], pattern: str, log_root: Path) -> Path | None:
     if not log_root.exists():
         return None
-    after = set(log_root.glob(pattern))
+    after = {p for p in log_root.glob(pattern) if p.is_dir()}
     created = sorted((after - before), key=lambda p: p.stat().st_mtime)
     if created:
         return created[-1]
     candidates = sorted(after, key=lambda p: p.stat().st_mtime)
     return candidates[-1] if candidates else None
+
+
+def _find_log_dir_by_experiment_name(log_roots: list[Path], experiment_name: str) -> Path | None:
+    candidates: list[Path] = []
+    for root in log_roots:
+        if not root.exists():
+            continue
+        matches = [p for p in root.glob(f"*{experiment_name}*") if p.is_dir()]
+        candidates.extend(matches)
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda p: p.stat().st_mtime)[-1]
 
 
 def _load_dataset(h5_path: Path, npz_path: Path):
@@ -106,13 +141,37 @@ def main() -> None:
     config, used_kwargs = _build_cql_config(d3rlpy, batch_size=args.batch_size, alpha=args.alpha)
     algo = config.create(device=args.device)
 
-    log_root = Path("d3rlpy_logs")
-    before_logs = set(log_root.glob("DiscreteCQL_*")) if log_root.exists() else set()
-    _fit_algo(algo, dataset, n_steps=args.n_steps, eval_interval=args.eval_interval)
-    log_dir = _find_new_log_dir(before=before_logs, pattern="DiscreteCQL_*")
-
     run_dir = args.out_dir / f"alpha_{args.alpha:g}"
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Deterministic naming avoids race conditions across fast alpha/step sweeps.
+    experiment_name = f"CQL_alpha_{args.alpha:g}_steps_{args.n_steps}_seed_{args.seed}"
+    run_log_root = run_dir / "d3rlpy_logs"
+    run_log_root.mkdir(parents=True, exist_ok=True)
+
+    global_log_root = Path("d3rlpy_logs")
+    before_run_logs = {p for p in run_log_root.glob("*CQL*") if p.is_dir()} if run_log_root.exists() else set()
+    before_global_logs = {p for p in global_log_root.glob("*CQL*") if p.is_dir()} if global_log_root.exists() else set()
+
+    fit_kwargs_used = _fit_algo(
+        algo,
+        dataset,
+        n_steps=args.n_steps,
+        eval_interval=args.eval_interval,
+        experiment_name=experiment_name,
+        log_root=run_log_root,
+    )
+    fit_kwargs_summary = {k: v for k, v in fit_kwargs_used.items() if k != "dataset"}
+
+    log_dir = _find_new_log_dir(before=before_run_logs, pattern="*CQL*", log_root=run_log_root)
+    if log_dir is None:
+        log_dir = _find_new_log_dir(before=before_global_logs, pattern="*CQL*", log_root=global_log_root)
+    if log_dir is None:
+        log_dir = _find_log_dir_by_experiment_name(
+            log_roots=[run_log_root, global_log_root],
+            experiment_name=experiment_name,
+        )
+
     model_path = run_dir / "cql_model.d3"
     algo.save_model(str(model_path))
 
@@ -124,6 +183,9 @@ def main() -> None:
         "n_steps": args.n_steps,
         "alpha_requested": args.alpha,
         "config_kwargs_used": used_kwargs,
+        "fit_kwargs_used": fit_kwargs_summary,
+        "experiment_name": experiment_name,
+        "requested_log_root": str(run_log_root),
         "dataset_h5": str(args.dataset_h5),
         "dataset_npz": str(args.dataset_npz),
         "model_path": str(model_path),

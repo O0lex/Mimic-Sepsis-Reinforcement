@@ -11,6 +11,26 @@ def _run(cmd: list[str], cwd: Path) -> None:
     subprocess.run(cmd, cwd=str(cwd), check=True)
 
 
+def _parse_float_list(raw: str) -> list[float]:
+    vals: list[float] = []
+    for token in raw.split(","):
+        s = token.strip()
+        if not s:
+            continue
+        vals.append(float(s))
+    return vals
+
+
+def _parse_int_list(raw: str) -> list[int]:
+    vals: list[int] = []
+    for token in raw.split(","):
+        s = token.strip()
+        if not s:
+            continue
+        vals.append(int(s))
+    return vals
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run end-to-end mock offline RL pipeline.")
     parser.add_argument("--python", type=str, default=sys.executable)
@@ -35,6 +55,39 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--hosp-dataset", type=str, default="mimiciv_hosp")
     parser.add_argument("--max-stays", type=int, default=500)
     parser.add_argument("--mu-source", type=str, choices=["auto", "csv", "bc_model"], default="auto")
+    parser.add_argument(
+        "--cql-alphas",
+        type=str,
+        default="0.25,0.5,0.75,1.0,1.5,2.0,2.5,5.0,7.5,10.0",
+        help="Comma-separated alpha values for CQL sweep in mimic-profile mode.",
+    )
+    parser.add_argument(
+        "--cql-step-sweep",
+        type=str,
+        default="1000,5000,10000",
+        help="Comma-separated n-steps values for CQL sweep in mimic-profile mode.",
+    )
+    parser.add_argument(
+        "--cql-long-alphas",
+        type=str,
+        default="1.0,2.5,5.0",
+        help="Comma-separated alpha values that should additionally run at long horizons.",
+    )
+    parser.add_argument(
+        "--cql-long-steps",
+        type=str,
+        default="50000,100000",
+        help="Comma-separated long-run n-steps values for selected --cql-long-alphas.",
+    )
+    parser.add_argument(
+        "--cql-eval-interval",
+        type=int,
+        default=10000,
+        help="Training metric logging/report interval for CQL runs.",
+    )
+    parser.add_argument("--bc-steps", type=int, default=1000)
+    parser.add_argument("--report-alpha", type=float, default=1.5)
+    parser.add_argument("--report-steps", type=int, default=1000)
     return parser.parse_args()
 
 
@@ -83,7 +136,44 @@ def main() -> None:
             bc_dir = f"outputs/models/{profile}/bc"
             cql_dir = f"outputs/models/{profile}/cql"
             bc_model = f"{bc_dir}/bc_model.d3"
-            cql_model = f"{cql_dir}/alpha_1/cql_model.d3"
+            refinement_alphas = _parse_float_list(args.cql_alphas)
+            step_sweep = _parse_int_list(args.cql_step_sweep)
+            long_alphas = _parse_float_list(args.cql_long_alphas)
+            long_steps = _parse_int_list(args.cql_long_steps)
+            if not refinement_alphas:
+                raise ValueError("--cql-alphas resolved to an empty list.")
+            if not step_sweep:
+                raise ValueError("--cql-step-sweep resolved to an empty list.")
+            if not long_alphas:
+                raise ValueError("--cql-long-alphas resolved to an empty list.")
+            if not long_steps:
+                raise ValueError("--cql-long-steps resolved to an empty list.")
+
+            if args.report_alpha not in refinement_alphas:
+                refinement_alphas.append(args.report_alpha)
+            if args.report_steps not in step_sweep:
+                step_sweep.append(args.report_steps)
+            if args.report_alpha not in long_alphas:
+                long_alphas.append(args.report_alpha)
+            if args.report_steps not in long_steps:
+                long_steps.append(args.report_steps)
+
+            refinement_alphas = sorted(set(refinement_alphas))
+            step_sweep = sorted(set(step_sweep))
+            long_alphas = sorted(set(long_alphas))
+            long_steps = sorted(set(long_steps))
+
+            training_pairs = {(int(s), float(a)) for s in step_sweep for a in refinement_alphas}
+            training_pairs.update({(int(s), float(a)) for s in long_steps for a in long_alphas})
+
+            report_alpha = args.report_alpha
+            report_steps = args.report_steps
+
+            def _alpha_tag(a: float) -> str:
+                s = f"{a:g}"
+                return s.replace(".", "_") if "." in s else s
+
+            cql_model = f"{cql_dir}/steps_{report_steps}/alpha_{report_alpha:g}/cql_model.d3"
 
             steps.append(
                 [
@@ -99,95 +189,115 @@ def main() -> None:
             )
 
             if not args.skip_train:
-                steps.extend(
+                steps.append(
                     [
-                        [
-                            args.python,
-                            "-m",
-                            "src.train.train_bc",
-                            "--dataset-h5",
-                            dataset_h5,
-                            "--dataset-npz",
-                            dataset_npz,
-                            "--out-dir",
-                            bc_dir,
-                            "--n-steps",
-                            "500",
-                        ],
-                        [
-                            args.python,
-                            "-m",
-                            "src.train.train_cql",
-                            "--dataset-h5",
-                            dataset_h5,
-                            "--dataset-npz",
-                            dataset_npz,
-                            "--out-dir",
-                            cql_dir,
-                            "--alpha",
-                            "0.1",
-                            "--n-steps",
-                            "500",
-                        ],
-                        [
-                            args.python,
-                            "-m",
-                            "src.train.train_cql",
-                            "--dataset-h5",
-                            dataset_h5,
-                            "--dataset-npz",
-                            dataset_npz,
-                            "--out-dir",
-                            cql_dir,
-                            "--alpha",
-                            "1.0",
-                            "--n-steps",
-                            "500",
-                        ],
-                        [
-                            args.python,
-                            "-m",
-                            "src.train.train_cql",
-                            "--dataset-h5",
-                            dataset_h5,
-                            "--dataset-npz",
-                            dataset_npz,
-                            "--out-dir",
-                            cql_dir,
-                            "--alpha",
-                            "5.0",
-                            "--n-steps",
-                            "500",
-                        ],
-                    ]
-                )
-
-            wis_step = [
-                args.python,
-                "-m",
-                "src.ope.wis_eval",
-                "--in-csv",
-                ope_csv,
-                "--out-json",
-                wis_json,
-                "--out-csv",
-                ope_csv,
-                "--mu-source",
-                mu_source,
-            ]
-            if mu_source == "bc_model":
-                wis_step.extend(
-                    [
+                        args.python,
+                        "-m",
+                        "src.train.train_bc",
+                        "--dataset-h5",
+                        dataset_h5,
                         "--dataset-npz",
                         dataset_npz,
-                        "--bc-model",
-                        bc_model,
-                        "--cql-model",
-                        cql_model,
-                        "--sync-bc-prob-with-mu",
+                        "--out-dir",
+                        bc_dir,
+                        "--n-steps",
+                        str(args.bc_steps),
                     ]
                 )
-            steps.append(wis_step)
+                for step_count in step_sweep:
+                    cql_step_dir = f"{cql_dir}/steps_{step_count}"
+                    for alpha in refinement_alphas:
+                        steps.append(
+                            [
+                                args.python,
+                                "-m",
+                                "src.train.train_cql",
+                                "--dataset-h5",
+                                dataset_h5,
+                                "--dataset-npz",
+                                dataset_npz,
+                                "--out-dir",
+                                cql_step_dir,
+                                "--alpha",
+                                str(alpha),
+                                "--n-steps",
+                                str(step_count),
+                                "--eval-interval",
+                                str(args.cql_eval_interval),
+                            ]
+                        )
+                # Add targeted long-horizon runs for selected alphas.
+                for step_count in long_steps:
+                    cql_step_dir = f"{cql_dir}/steps_{step_count}"
+                    for alpha in long_alphas:
+                        if (int(step_count), float(alpha)) in {(int(s), float(a)) for s in step_sweep for a in refinement_alphas}:
+                            continue
+                        steps.append(
+                            [
+                                args.python,
+                                "-m",
+                                "src.train.train_cql",
+                                "--dataset-h5",
+                                dataset_h5,
+                                "--dataset-npz",
+                                dataset_npz,
+                                "--out-dir",
+                                cql_step_dir,
+                                "--alpha",
+                                str(alpha),
+                                "--n-steps",
+                                str(step_count),
+                                "--eval-interval",
+                                str(args.cql_eval_interval),
+                            ]
+                        )
+
+            if mu_source == "bc_model":
+                for step_count, alpha in sorted(training_pairs, key=lambda x: (x[0], x[1])):
+                        alpha_tag = _alpha_tag(alpha)
+                        model_path = f"{cql_dir}/steps_{step_count}/alpha_{alpha:g}/cql_model.d3"
+                        alpha_wis_json = (
+                            f"outputs/ope/mimic_mdp_{profile}_wis_s{step_count}_a{alpha_tag}.json"
+                        )
+                        steps.append(
+                            [
+                                args.python,
+                                "-m",
+                                "src.ope.wis_eval",
+                                "--in-csv",
+                                ope_csv,
+                                "--out-json",
+                                alpha_wis_json,
+                                "--mu-source",
+                                "bc_model",
+                                "--dataset-npz",
+                                dataset_npz,
+                                "--bc-model",
+                                bc_model,
+                                "--cql-model",
+                                model_path,
+                                "--sync-bc-prob-with-mu",
+                            ]
+                        )
+                wis_json = (
+                    f"outputs/ope/mimic_mdp_{profile}_wis_s{report_steps}_a{_alpha_tag(report_alpha)}.json"
+                )
+                cql_model = f"{cql_dir}/steps_{report_steps}/alpha_{report_alpha:g}/cql_model.d3"
+            else:
+                wis_step = [
+                    args.python,
+                    "-m",
+                    "src.ope.wis_eval",
+                    "--in-csv",
+                    ope_csv,
+                    "--out-json",
+                    wis_json,
+                    "--out-csv",
+                    ope_csv,
+                    "--mu-source",
+                    mu_source,
+                ]
+                steps.append(wis_step)
 
             steps.append(
                 [

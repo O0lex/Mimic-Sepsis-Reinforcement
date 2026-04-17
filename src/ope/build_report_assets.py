@@ -49,21 +49,50 @@ def _parse_alpha_from_path(path: Path) -> float:
     return 0.0
 
 
+def _parse_steps_from_path(path: Path) -> int:
+    for parent in path.parents:
+        name = parent.name
+        if name.startswith("steps_"):
+            try:
+                return int(name.replace("steps_", ""))
+            except ValueError:
+                continue
+    return 0
+
+
 def _find_latest_log_dir(pattern: str) -> Path | None:
     root = Path("d3rlpy_logs")
     if not root.exists():
         return None
-    matches = sorted(root.glob(pattern), key=lambda p: p.stat().st_mtime)
+    matches = sorted((p for p in root.glob(pattern) if p.is_dir()), key=lambda p: p.stat().st_mtime)
     return matches[-1] if matches else None
 
 
-def _resolve_log_dir(metrics: dict | None, pattern: str) -> Path | None:
+def _resolve_log_dir(metrics: dict | None, pattern: str, metrics_path: Path | None = None) -> Path | None:
     if metrics is not None:
         log_dir = metrics.get("log_dir")
         if log_dir:
             p = Path(log_dir)
             if p.exists():
                 return p
+
+    target_time = None
+    if metrics is not None:
+        model_path = metrics.get("model_path")
+        if model_path:
+            mp = Path(model_path)
+            if mp.exists():
+                target_time = mp.stat().st_mtime
+
+    if target_time is None and metrics_path is not None and metrics_path.exists():
+        target_time = metrics_path.stat().st_mtime
+
+    root = Path("d3rlpy_logs")
+    if target_time is not None and root.exists():
+        matches = [p for p in root.glob(pattern) if p.is_dir()]
+        if matches:
+            return min(matches, key=lambda p: abs(p.stat().st_mtime - target_time))
+
     return _find_latest_log_dir(pattern)
 
 
@@ -341,7 +370,22 @@ def _build_alpha_sensitivity(
     wis_clip: float,
 ) -> tuple[Path | None, list[dict[str, float]]]:
     alpha_points: list[dict[str, float]] = []
-    model_paths = sorted(args.cql_dir.glob("alpha_*/cql_model.d3"), key=_parse_alpha_from_path)
+    model_paths = sorted(
+        args.cql_dir.glob("**/alpha_*/cql_model.d3"),
+        key=lambda p: (_parse_steps_from_path(p), _parse_alpha_from_path(p)),
+    )
+
+    target_step: str | None = None
+    for parent in args.cql_model.parents:
+        if parent.name.startswith("steps_"):
+            target_step = parent.name
+            break
+
+    if target_step is not None:
+        filtered = [p for p in model_paths if target_step in {q.name for q in p.parents}]
+        if filtered:
+            model_paths = filtered
+
     if not model_paths:
         return None, alpha_points
 
@@ -432,17 +476,19 @@ def main() -> None:
 
     # Plot 1: Training objective curves (paper Figure 2 analogue).
     bc_metrics = _read_json(args.bc_metrics_json) if args.bc_metrics_json.exists() else None
-    bc_log_dir = _resolve_log_dir(metrics=bc_metrics, pattern="DiscreteBC_*")
+    bc_log_dir = _resolve_log_dir(metrics=bc_metrics, pattern="**/*BC*")
 
-    cql_run_metrics: list[tuple[float, dict]] = []
+    cql_run_metrics: list[tuple[int, float, dict, Path]] = []
     if args.cql_dir.exists():
-        metrics_paths = sorted(args.cql_dir.glob("alpha_*/train_metrics.json"))
-        if not metrics_paths:
-            metrics_paths = sorted(args.cql_dir.glob("alpha_**/**/train_metrics.json"))
+        metrics_paths = sorted(args.cql_dir.glob("**/alpha_*/train_metrics.json"))
         for mpath in metrics_paths:
             m = _read_json(mpath)
-            cql_run_metrics.append((float(m.get("alpha_requested", 0.0)), m))
-    cql_run_metrics.sort(key=lambda x: x[0])
+            alpha = float(m.get("alpha_requested", _parse_alpha_from_path(mpath.parent)))
+            steps = _parse_steps_from_path(mpath)
+            if steps <= 0:
+                steps = int(m.get("n_steps", 0))
+            cql_run_metrics.append((steps, alpha, m, mpath))
+    cql_run_metrics.sort(key=lambda x: (x[0], x[1]))
 
     training_curves_fig = None
     if bc_log_dir is not None or cql_run_metrics:
@@ -469,8 +515,8 @@ def main() -> None:
 
         # CQL objective curves by alpha.
         plotted_cql = False
-        for alpha, metrics in cql_run_metrics:
-            cql_log_dir = _resolve_log_dir(metrics=metrics, pattern="DiscreteCQL_*")
+        for steps, alpha, metrics, mpath in cql_run_metrics:
+            cql_log_dir = _resolve_log_dir(metrics=metrics, pattern="**/*CQL*", metrics_path=mpath)
             if cql_log_dir is None:
                 continue
             td_path = cql_log_dir / "td_loss.csv"
@@ -479,7 +525,8 @@ def main() -> None:
             if not curve_path.exists():
                 continue
             cql_df = _read_metric_curve(curve_path)
-            axes[1].plot(cql_df["step"], cql_df["value"], linewidth=1.8, label=f"alpha={alpha:g}")
+            lbl = f"a={alpha:g}, s={steps}" if steps > 0 else f"a={alpha:g}"
+            axes[1].plot(cql_df["step"], cql_df["value"], linewidth=1.8, label=lbl)
             plotted_cql = True
 
         if plotted_cql:
