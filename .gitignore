@@ -18,6 +18,14 @@ dist/
 # Runtime logs and outputs
 outputs/
 d3rlpy_logs/
+logs/
+
+# Local scratch artifacts
+outsideshit/
+report/pastresults.txt
+
+# Generated report figures not currently part of tracked report set
+report/generated/figures/**/fig5_action_distribution_comparison.png
 
 # OS/editor noise
 .DS_Store

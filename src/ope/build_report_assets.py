@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import re
 
 import matplotlib
 import numpy as np
@@ -32,6 +33,30 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--out-table", type=Path, default=Path("report/generated/results_table.tex"))
     parser.add_argument("--icu-summary-json", type=Path, default=Path("outputs/data/icu_sepsis_summary.json"))
     parser.add_argument("--icu-wis-json", type=Path, default=Path("outputs/ope/icu_sepsis_wis_summary.json"))
+    parser.add_argument(
+        "--sweep-search-dirs",
+        type=str,
+        default="outputs/ope,outsideshit/ope best results,outsideshit/ope best results/all training curves",
+        help="Comma-separated directories scanned for mimic_mdp_*_wis_s*_a*.json files.",
+    )
+    parser.add_argument(
+        "--sweep-steps-target",
+        type=str,
+        default="3000,5000,10000,15000,50000,100000",
+        help="Comma-separated step targets used to report missing sweep cells.",
+    )
+    parser.add_argument(
+        "--sweep-alphas-target",
+        type=str,
+        default="",
+        help="Optional comma-separated alpha targets for missing-cell checks. Empty = use discovered alphas.",
+    )
+    parser.add_argument(
+        "--sweep-index-csv",
+        type=Path,
+        default=Path("report/generated/sweep_index.csv"),
+        help="Consolidated sweep index output.",
+    )
     return parser.parse_args()
 
 
@@ -58,6 +83,318 @@ def _parse_steps_from_path(path: Path) -> int:
             except ValueError:
                 continue
     return 0
+
+
+def _parse_gamma_from_path(path: Path) -> float:
+    for parent in path.parents:
+        name = parent.name
+        if name.startswith("gamma_"):
+            try:
+                return float(name.replace("gamma_", "").replace("_", "."))
+            except ValueError:
+                continue
+    return 0.99
+
+
+def _parse_float_list(raw: str) -> list[float]:
+    vals: list[float] = []
+    for token in raw.split(","):
+        s = token.strip()
+        if not s:
+            continue
+        vals.append(float(s))
+    return vals
+
+
+def _parse_int_list(raw: str) -> list[int]:
+    vals: list[int] = []
+    for token in raw.split(","):
+        s = token.strip()
+        if not s:
+            continue
+        vals.append(int(s))
+    return vals
+
+
+def _parse_wis_filename(path: Path) -> dict | None:
+    m = re.search(
+        r"mimic_mdp_(?P<profile>full|minimal)_wis_s(?P<steps>\d+)_a(?P<alpha>[\d_]+)(?:_g(?P<gamma>[\d_]+))?\.json$",
+        path.name,
+    )
+    if not m:
+        return None
+
+    profile = str(m.group("profile"))
+    steps = int(m.group("steps"))
+    alpha = float(str(m.group("alpha")).replace("_", "."))
+    gamma_group = m.group("gamma")
+    gamma = float(str(gamma_group).replace("_", ".")) if gamma_group else 0.99
+    return {
+        "profile": profile,
+        "steps": steps,
+        "alpha": alpha,
+        "gamma": gamma,
+    }
+
+
+def _collect_sweep_index(search_dirs: list[Path]) -> pd.DataFrame:
+    dedup: dict[tuple[str, int, float, float], dict] = {}
+
+    for root in search_dirs:
+        if not root.exists() or not root.is_dir():
+            continue
+        for path in root.glob("**/mimic_mdp_*_wis_s*_a*.json"):
+            info = _parse_wis_filename(path)
+            if info is None:
+                continue
+            try:
+                payload = _read_json(path)
+            except Exception:
+                continue
+
+            ci = payload.get("cql_wis_ci95") or [None, None]
+            row = {
+                "profile": info["profile"],
+                "steps": int(info["steps"]),
+                "alpha": float(info["alpha"]),
+                "gamma": float(info["gamma"]),
+                "behavior_episode_return": payload.get("behavior_episode_return"),
+                "bc_wis_mean": payload.get("bc_wis_mean"),
+                "cql_wis_mean": payload.get("cql_wis_mean", payload.get("v_mean")),
+                "cql_ci_low": ci[0] if isinstance(ci, list) and len(ci) >= 2 else None,
+                "cql_ci_high": ci[1] if isinstance(ci, list) and len(ci) >= 2 else None,
+                "cql_ess": payload.get("cql_ess"),
+                "file_path": str(path),
+                "mtime": float(path.stat().st_mtime),
+            }
+
+            key = (row["profile"], row["steps"], row["alpha"], row["gamma"])
+            prev = dedup.get(key)
+            if prev is None or float(row["mtime"]) > float(prev["mtime"]):
+                dedup[key] = row
+
+    if not dedup:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(list(dedup.values()))
+    df = df.sort_values(["profile", "steps", "gamma", "alpha"]).reset_index(drop=True)
+    return df
+
+
+def _resolve_feature_names(summary: dict, dataset_npz: Path, state_dim: int) -> list[str]:
+    names = summary.get("top_feature_codes")
+    if isinstance(names, list) and names:
+        out = [str(x) for x in names]
+        if len(out) >= state_dim:
+            return out[:state_dim]
+
+    npz_name = dataset_npz.name.lower()
+    if "minimal" in npz_name:
+        cand = summary.get("minimal_profile", {}).get("features")
+        if isinstance(cand, list) and len(cand) >= state_dim:
+            return [str(x) for x in cand[:state_dim]]
+    if "full" in npz_name:
+        cand = summary.get("full_profile", {}).get("features")
+        if isinstance(cand, list) and len(cand) >= state_dim:
+            return [str(x) for x in cand[:state_dim]]
+
+    for profile_key in ["minimal_profile", "full_profile"]:
+        cand = summary.get(profile_key, {}).get("features")
+        if isinstance(cand, list) and len(cand) == state_dim:
+            return [str(x) for x in cand]
+
+    return [f"f{i}" for i in range(state_dim)]
+
+
+def _plot_sweep_linear(df: pd.DataFrame, profile: str, fig_dir: Path) -> Path | None:
+    if df.empty:
+        return None
+
+    fig, ax = plt.subplots(figsize=(11.5, 6.5))
+    alphas = sorted(df["alpha"].dropna().unique().tolist())
+    for alpha in alphas:
+        adf = df[df["alpha"] == alpha].sort_values("steps")
+        if adf.empty:
+            continue
+        ax.plot(adf["steps"], adf["cql_wis_mean"], marker="o", linewidth=1.8, label=f"alpha={alpha:g}")
+
+    baseline = float(df["behavior_episode_return"].dropna().mean()) if df["behavior_episode_return"].notna().any() else None
+    if baseline is not None:
+        ax.axhline(y=baseline, color="red", linestyle="--", alpha=0.65, label="Clinician baseline")
+
+    ax.set_xlabel("Training Steps (linear)")
+    ax.set_ylabel("WIS Mean Return")
+    ax.set_title(f"Sweep Trend ({profile.capitalize()} profile)")
+    ax.grid(True, linestyle=":", alpha=0.5)
+    ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False, fontsize=8)
+    fig.tight_layout()
+
+    out_path = fig_dir / f"sweep_trend_linear_{profile}.png"
+    fig.savefig(out_path, dpi=170)
+    plt.close(fig)
+    return out_path
+
+
+def _plot_sweep_log(df: pd.DataFrame, profile: str, fig_dir: Path) -> Path | None:
+    if df.empty:
+        return None
+
+    fig, ax = plt.subplots(figsize=(11.5, 6.5))
+    alphas = sorted(df["alpha"].dropna().unique().tolist())
+    for alpha in alphas:
+        adf = df[df["alpha"] == alpha].sort_values("steps")
+        if adf.empty:
+            continue
+        ax.plot(adf["steps"], adf["cql_wis_mean"], marker="o", linewidth=1.8, label=f"alpha={alpha:g}")
+
+    baseline = float(df["behavior_episode_return"].dropna().mean()) if df["behavior_episode_return"].notna().any() else None
+    if baseline is not None:
+        ax.axhline(y=baseline, color="red", linestyle="--", alpha=0.65, label="Clinician baseline")
+
+    ax.set_xscale("log")
+    ax.set_xlabel("Training Steps (log scale)")
+    ax.set_ylabel("WIS Mean Return")
+    ax.set_title(f"Sweep Trend ({profile.capitalize()} profile)")
+    ax.grid(True, linestyle=":", alpha=0.5)
+    ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False, fontsize=8)
+    fig.tight_layout()
+
+    out_path = fig_dir / f"sweep_trend_{profile}.png"
+    fig.savefig(out_path, dpi=170)
+    plt.close(fig)
+    return out_path
+
+
+def _plot_sweep_heatmap(df: pd.DataFrame, profile: str, fig_dir: Path) -> Path | None:
+    if df.empty:
+        return None
+    pivot = df.pivot_table(index="steps", columns="alpha", values="cql_wis_mean", aggfunc="mean")
+    if pivot.empty:
+        return None
+
+    fig, ax = plt.subplots(figsize=(8.6, 5.2))
+    im = ax.imshow(pivot.values, aspect="auto", cmap="viridis", origin="lower")
+    ax.set_title(f"WIS Heatmap ({profile.capitalize()})")
+    ax.set_xlabel("Alpha")
+    ax.set_ylabel("Steps")
+    ax.set_xticks(np.arange(pivot.shape[1]))
+    ax.set_xticklabels([f"{float(a):g}" for a in pivot.columns], rotation=35, ha="right")
+    ax.set_yticks(np.arange(pivot.shape[0]))
+    ax.set_yticklabels([str(int(s)) for s in pivot.index])
+    cbar = plt.colorbar(im)
+    cbar.set_label("CQL WIS Mean")
+    fig.tight_layout()
+
+    out_path = fig_dir / f"fig11_sweep_heatmap_{profile}.png"
+    fig.savefig(out_path, dpi=170)
+    plt.close(fig)
+    return out_path
+
+
+def _plot_algorithm_means(df: pd.DataFrame, profile: str, fig_dir: Path) -> Path | None:
+    if df.empty:
+        return None
+
+    vals = {
+        "Behavior": float(df["behavior_episode_return"].dropna().mean()) if df["behavior_episode_return"].notna().any() else np.nan,
+        "BC": float(df["bc_wis_mean"].dropna().mean()) if df["bc_wis_mean"].notna().any() else np.nan,
+        "CQL": float(df["cql_wis_mean"].dropna().mean()) if df["cql_wis_mean"].notna().any() else np.nan,
+    }
+    names = list(vals.keys())
+    arr = np.asarray([vals[n] for n in names], dtype=np.float64)
+    if np.isnan(arr).all():
+        return None
+
+    fig, ax = plt.subplots(figsize=(6.2, 4.2))
+    ax.bar(names, arr, color=["#7f7f7f", "#1f77b4", "#d62728"], alpha=0.9)
+    ax.set_ylabel("Mean Return")
+    ax.set_title(f"Mean Return by Algorithm ({profile.capitalize()})")
+    ax.grid(axis="y", alpha=0.3)
+    fig.tight_layout()
+
+    out_path = fig_dir / f"fig12_mean_return_algorithms_{profile}.png"
+    fig.savefig(out_path, dpi=170)
+    plt.close(fig)
+    return out_path
+
+
+def _build_sweep_artifacts(args: argparse.Namespace) -> dict:
+    search_dirs = [Path(p.strip()) for p in args.sweep_search_dirs.split(",") if p.strip()]
+    df = _collect_sweep_index(search_dirs)
+    if df.empty:
+        return {"index_csv": None, "profiles": {}, "figures": {}}
+
+    ensure_parent(args.sweep_index_csv)
+    df.to_csv(args.sweep_index_csv, index=False)
+
+    steps_target = sorted(set(_parse_int_list(args.sweep_steps_target)))
+    alpha_target = sorted(set(_parse_float_list(args.sweep_alphas_target))) if args.sweep_alphas_target.strip() else []
+
+    profiles: dict[str, dict] = {}
+    figures: dict[str, str] = {}
+
+    for profile in sorted(df["profile"].unique().tolist()):
+        pdf = df[df["profile"] == profile].copy()
+        if pdf.empty:
+            continue
+
+        # Keep plotting readable by selecting the most common gamma slice.
+        gamma_mode = float(pdf["gamma"].mode().iloc[0]) if not pdf["gamma"].empty else 0.99
+        plot_df = pdf[pdf["gamma"] == gamma_mode].copy()
+        if plot_df.empty:
+            plot_df = pdf
+
+        best_row = plot_df.loc[plot_df["cql_wis_mean"].astype(float).idxmax()]
+        ci_ready = plot_df.dropna(subset=["cql_ci_low"])
+        best_ci_row = ci_ready.loc[ci_ready["cql_ci_low"].astype(float).idxmax()] if not ci_ready.empty else None
+
+        check_alphas = alpha_target if alpha_target else sorted(plot_df["alpha"].unique().tolist())
+        existing = {(int(r.steps), float(r.alpha)) for r in plot_df[["steps", "alpha"]].itertuples(index=False)}
+        missing = [{"steps": int(s), "alpha": float(a)} for s in steps_target for a in check_alphas if (int(s), float(a)) not in existing]
+
+        log_fig = _plot_sweep_log(plot_df, profile=profile, fig_dir=args.fig_dir)
+        line_fig = _plot_sweep_linear(plot_df, profile=profile, fig_dir=args.fig_dir)
+        heat_fig = _plot_sweep_heatmap(plot_df, profile=profile, fig_dir=args.fig_dir)
+        mean_fig = _plot_algorithm_means(plot_df, profile=profile, fig_dir=args.fig_dir)
+
+        if log_fig is not None:
+            figures[f"sweep_trend_{profile}"] = str(log_fig)
+        if line_fig is not None:
+            figures[f"sweep_trend_linear_{profile}"] = str(line_fig)
+        if heat_fig is not None:
+            figures[f"fig11_sweep_heatmap_{profile}"] = str(heat_fig)
+        if mean_fig is not None:
+            figures[f"fig12_mean_return_algorithms_{profile}"] = str(mean_fig)
+
+        profiles[profile] = {
+            "gamma_selected_for_plots": gamma_mode,
+            "n_points": int(plot_df.shape[0]),
+            "best_mean": {
+                "steps": int(best_row["steps"]),
+                "alpha": float(best_row["alpha"]),
+                "gamma": float(best_row["gamma"]),
+                "cql_wis_mean": float(best_row["cql_wis_mean"]),
+                "file_path": str(best_row["file_path"]),
+            },
+            "best_ci_low": (
+                {
+                    "steps": int(best_ci_row["steps"]),
+                    "alpha": float(best_ci_row["alpha"]),
+                    "gamma": float(best_ci_row["gamma"]),
+                    "cql_ci_low": float(best_ci_row["cql_ci_low"]),
+                    "file_path": str(best_ci_row["file_path"]),
+                }
+                if best_ci_row is not None
+                else None
+            ),
+            "missing_grid": missing,
+        }
+
+    return {
+        "index_csv": str(args.sweep_index_csv),
+        "profiles": profiles,
+        "figures": figures,
+    }
 
 
 def _find_latest_log_dir(pattern: str) -> Path | None:
@@ -178,9 +515,17 @@ def _predict_cql_probs_all_actions(
     import d3rlpy
     import torch
 
-    algo = d3rlpy.algos.DiscreteCQLConfig(alpha=1.0).create(device="cpu")
-    algo.build_with_dataset(dataset)
-    algo.load_model(str(cql_model))
+    # Register custom Q-function factories (e.g., dueling) for load_learnable deserialization.
+    from src.train import dueling_q  # noqa: F401
+
+    algo = None
+    try:
+        algo = d3rlpy.load_learnable(str(cql_model), device="cpu")
+    except Exception:
+        # Backward compatibility with legacy artifacts saved via save_model.
+        algo = d3rlpy.algos.DiscreteCQLConfig(alpha=1.0).create(device="cpu")
+        algo.build_with_dataset(dataset)
+        algo.load_model(str(cql_model))
 
     q_forwarder = getattr(algo.impl, "_q_func_forwarder", None)
     if q_forwarder is None or not hasattr(q_forwarder, "compute_expected_q"):
@@ -372,17 +717,23 @@ def _build_alpha_sensitivity(
     alpha_points: list[dict[str, float]] = []
     model_paths = sorted(
         args.cql_dir.glob("**/alpha_*/cql_model.d3"),
-        key=lambda p: (_parse_steps_from_path(p), _parse_alpha_from_path(p)),
+        key=lambda p: (_parse_steps_from_path(p), _parse_gamma_from_path(p), _parse_alpha_from_path(p)),
     )
 
     target_step: str | None = None
+    target_gamma: str | None = None
     for parent in args.cql_model.parents:
         if parent.name.startswith("steps_"):
             target_step = parent.name
-            break
+        if parent.name.startswith("gamma_"):
+            target_gamma = parent.name
 
     if target_step is not None:
         filtered = [p for p in model_paths if target_step in {q.name for q in p.parents}]
+        if filtered:
+            model_paths = filtered
+    if target_gamma is not None:
+        filtered = [p for p in model_paths if target_gamma in {q.name for q in p.parents}]
         if filtered:
             model_paths = filtered
 
@@ -454,6 +805,7 @@ def main() -> None:
     wis = _read_json(args.wis_json)
 
     args.fig_dir.mkdir(parents=True, exist_ok=True)
+    sweep_info = _build_sweep_artifacts(args)
 
     # Baseline values are needed by multiple figures.
     behavior_v = float(wis.get("behavior_episode_return", 0.0))
@@ -478,17 +830,25 @@ def main() -> None:
     bc_metrics = _read_json(args.bc_metrics_json) if args.bc_metrics_json.exists() else None
     bc_log_dir = _resolve_log_dir(metrics=bc_metrics, pattern="**/*BC*")
 
-    cql_run_metrics: list[tuple[int, float, dict, Path]] = []
+    cql_run_metrics: list[tuple[int, float, float, dict, Path]] = []
     if args.cql_dir.exists():
         metrics_paths = sorted(args.cql_dir.glob("**/alpha_*/train_metrics.json"))
         for mpath in metrics_paths:
             m = _read_json(mpath)
             alpha = float(m.get("alpha_requested", _parse_alpha_from_path(mpath.parent)))
+            gamma = float(m.get("gamma_requested", _parse_gamma_from_path(mpath)))
             steps = _parse_steps_from_path(mpath)
             if steps <= 0:
                 steps = int(m.get("n_steps", 0))
-            cql_run_metrics.append((steps, alpha, m, mpath))
-    cql_run_metrics.sort(key=lambda x: (x[0], x[1]))
+            cql_run_metrics.append((steps, gamma, alpha, m, mpath))
+    cql_run_metrics.sort(key=lambda x: (x[0], x[1], x[2]))
+
+    if len(cql_run_metrics) > 12:
+        target_step = _parse_steps_from_path(args.cql_model)
+        target_gamma = _parse_gamma_from_path(args.cql_model)
+        focused = [x for x in cql_run_metrics if x[0] == target_step and abs(x[1] - target_gamma) < 1e-9]
+        if focused:
+            cql_run_metrics = focused
 
     training_curves_fig = None
     if bc_log_dir is not None or cql_run_metrics:
@@ -515,7 +875,7 @@ def main() -> None:
 
         # CQL objective curves by alpha.
         plotted_cql = False
-        for steps, alpha, metrics, mpath in cql_run_metrics:
+        for steps, gamma, alpha, metrics, mpath in cql_run_metrics:
             cql_log_dir = _resolve_log_dir(metrics=metrics, pattern="**/*CQL*", metrics_path=mpath)
             if cql_log_dir is None:
                 continue
@@ -525,7 +885,7 @@ def main() -> None:
             if not curve_path.exists():
                 continue
             cql_df = _read_metric_curve(curve_path)
-            lbl = f"a={alpha:g}, s={steps}" if steps > 0 else f"a={alpha:g}"
+            lbl = f"a={alpha:g}, g={gamma:g}, s={steps}" if steps > 0 else f"a={alpha:g}, g={gamma:g}"
             axes[1].plot(cql_df["step"], cql_df["value"], linewidth=1.8, label=lbl)
             plotted_cql = True
 
@@ -698,10 +1058,7 @@ def main() -> None:
             rf = RandomForestClassifier(n_estimators=300, random_state=42, class_weight="balanced_subsample")
             rf.fit(X, y)
 
-            names = summary.get("top_feature_codes") or [f"f{i}" for i in range(X.shape[1])]
-            if len(names) < X.shape[1]:
-                names = names + [f"f{i}" for i in range(len(names), X.shape[1])]
-            names = names[: X.shape[1]]
+            names = _resolve_feature_names(summary=summary, dataset_npz=args.dataset_npz, state_dim=X.shape[1])
 
             importances = rf.feature_importances_
             order = np.argsort(importances)[::-1][: min(20, importances.shape[0])]
@@ -811,6 +1168,7 @@ def main() -> None:
         "value_survival_corr": corr,
         "action_distribution_divergence": action_metrics,
         "model_eval_warning": model_eval_warning,
+        "sweep": sweep_info,
         "alpha_sensitivity_points": alpha_sensitivity_points,
         "top_features_rf_proxy": top_features,
         "figures": {
@@ -822,6 +1180,7 @@ def main() -> None:
             "fig8_mortality_deviation": str(mortality_deviation_fig) if mortality_deviation_fig is not None else None,
             "fig9_alpha_sensitivity": str(alpha_sensitivity_fig) if alpha_sensitivity_fig is not None else None,
             **heatmap_figs,
+            **sweep_info.get("figures", {}),
         },
         "recommended_additional_metrics": [
             "ESS (effective sample size) per policy",

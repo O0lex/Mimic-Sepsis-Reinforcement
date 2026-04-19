@@ -76,6 +76,31 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train-frac", type=float, default=0.7)
     parser.add_argument("--val-frac", type=float, default=0.15)
+    parser.add_argument(
+        "--reward-mode",
+        type=str,
+        choices=["terminal", "sofa_delta", "composite"],
+        default="terminal",
+        help="Reward construction mode. 'terminal' preserves legacy +/-1 endpoint rewards.",
+    )
+    parser.add_argument(
+        "--terminal-reward-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for terminal reward (+1/-1) component.",
+    )
+    parser.add_argument(
+        "--sofa-weight",
+        type=float,
+        default=0.1,
+        help="Weight for SOFA delta reward component in composite mode.",
+    )
+    parser.add_argument(
+        "--sofa-clip",
+        type=float,
+        default=1.0,
+        help="Clip absolute SOFA delta reward at this value.",
+    )
     return parser.parse_args()
 
 
@@ -309,10 +334,25 @@ def build_mdp_profiles(args: argparse.Namespace) -> None:
     df["is_terminal"] = (
         df.groupby(stay_col, sort=False)[window_col].transform("max") == df[window_col]
     ).astype(np.float32)
-    df["reward"] = 0.0
+
+    df["terminal_reward"] = 0.0
     died = pd.to_numeric(df[mortality_col], errors="coerce").fillna(0).astype(int)
-    df.loc[(df["is_terminal"] > 0) & (died == 0), "reward"] = 1.0
-    df.loc[(df["is_terminal"] > 0) & (died == 1), "reward"] = -1.0
+    df.loc[(df["is_terminal"] > 0) & (died == 0), "terminal_reward"] = 1.0
+    df.loc[(df["is_terminal"] > 0) & (died == 1), "terminal_reward"] = -1.0
+    df["terminal_reward"] = df["terminal_reward"] * float(args.terminal_reward_scale)
+
+    sofa_prev = df.groupby(stay_col, sort=False)["sofa_total"].shift(1)
+    df["sofa_delta_reward"] = (sofa_prev - df["sofa_total"]).fillna(0.0)
+    sofa_clip = abs(float(args.sofa_clip))
+    if sofa_clip > 0:
+        df["sofa_delta_reward"] = np.clip(df["sofa_delta_reward"], -sofa_clip, sofa_clip)
+
+    if args.reward_mode == "terminal":
+        df["reward"] = df["terminal_reward"]
+    elif args.reward_mode == "sofa_delta":
+        df["reward"] = df["sofa_delta_reward"]
+    else:
+        df["reward"] = df["terminal_reward"] + float(args.sofa_weight) * df["sofa_delta_reward"]
 
     # Patient-level split.
     rng = np.random.default_rng(args.seed)
@@ -392,6 +432,16 @@ def build_mdp_profiles(args: argparse.Namespace) -> None:
         },
         "minimal_profile": minimal_summary,
         "full_profile": full_summary,
+        "reward_config": {
+            "reward_mode": args.reward_mode,
+            "terminal_reward_scale": float(args.terminal_reward_scale),
+            "sofa_weight": float(args.sofa_weight),
+            "sofa_clip": float(args.sofa_clip),
+            "reward_mean": float(df["reward"].mean()),
+            "reward_std": float(df["reward"].std(ddof=0)),
+            "reward_min": float(df["reward"].min()),
+            "reward_max": float(df["reward"].max()),
+        },
         "null_counts_nonzero": null_report_json,
     }
 

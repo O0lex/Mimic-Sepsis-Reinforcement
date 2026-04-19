@@ -109,9 +109,17 @@ def _predict_logged_probs_cql(
     except ImportError as exc:
         raise RuntimeError("d3rlpy and torch are required for CQL probability estimation.") from exc
 
-    algo = d3rlpy.algos.DiscreteCQLConfig(alpha=1.0).create(device="cpu")
-    algo.build_with_dataset(dataset)
-    algo.load_model(str(cql_model_path))
+    # Register custom Q-function factories (e.g., dueling) for load_learnable deserialization.
+    from src.train import dueling_q  # noqa: F401
+
+    algo = None
+    try:
+        algo = d3rlpy.load_learnable(str(cql_model_path), device="cpu")
+    except Exception:
+        # Backward compatibility with legacy artifacts saved via save_model.
+        algo = d3rlpy.algos.DiscreteCQLConfig(alpha=1.0).create(device="cpu")
+        algo.build_with_dataset(dataset)
+        algo.load_model(str(cql_model_path))
 
     q_forwarder = getattr(algo.impl, "_q_func_forwarder", None)
     if q_forwarder is None or not hasattr(q_forwarder, "compute_expected_q"):

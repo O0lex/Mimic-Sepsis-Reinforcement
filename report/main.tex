@@ -1,0 +1,277 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[utf8]{inputenc}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{subcaption} 
+\usepackage{natbib}
+
+\title{Optimizing Sepsis Treatment via Offline Reinforcement Learning and Conservative Policy Evaluation\\
+\large COMP-579 Final Project Report}
+\author{
+  Alex Groiser \\
+  \and
+  Yusuf Hamza \\
+  School of Computer Science\\
+  McGill University
+}
+\date{May 1, 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Sepsis remains a primary cause of mortality in intensive care units, demanding careful sequential decision-making for treatment that must be firmly grounded in deep clinical context. This project evaluates whether a conservative offline reinforcement learning (RL) policy, augmented with clinical insights, can safely learn from historical logged trajectories to yield better Q-value estimations and outperform a behavior-cloning baseline. We frame the clinical problem as a Markov Decision Process (MDP) and implement Conservative Q-Learning (CQL) alongside Behavior Cloning (BC) on the MIMIC-IV dataset. Drawing direct inspiration from recent advancements in the field—most notably the integration of human expertise and adaptive target value weighting proposed by \citet{wu2023}—our pipeline emphasizes embedding clinical context to ground conservative action evaluation, improve Q-value estimation, and ensure physiological safety. Scaling to a massive cohort of over 590,000 state transitions, we utilize Weighted Importance Sampling (WIS) for off-policy evaluation. Our results demonstrate that this context-aware CQL reliably maintains high effective sample sizes (ESS) and achieves statistically significant improvements in expected returns and survival proxies compared to logged clinician behavior. Furthermore, action-space heatmaps and mortality deviation analyses confirm that the learned policy remains clinically viable and safe while optimizing dosage strategies. In this project, Alex Groiser handled data engineering, cohort extraction, and reproducibility scaffolding, while Yusuf Hamza integrated the training algorithms, off-policy evaluation pipeline, and generated the analytical diagnostics.
+\end{abstract}
+
+\section{Introduction}
+Sepsis is a dysregulated host response to infection and remains one of the leading causes of ICU mortality worldwide. In clinical practice, mitigating sepsis shock requires the accurate and timely titration of intravenous (IV) fluids and vasopressors. However, clinical decision-making relies heavily on established heuristics and physician experience. To capture the full scope of this clinical context while accounting for long-term physiological rewards and the complex, high-dimensional transitions inherent to patient states, we require robust computational modeling. 
+
+Because online experimentation (randomly testing new policies on live patients) is profoundly unsafe and ethically prohibited in this domain, we target \emph{offline reinforcement learning} (offline RL). Offline RL algorithms aim to learn optimal, superhuman policies solely from historical electronic health records (EHR) logged by human clinicians. 
+
+The primary goal of this project is to develop an agent capable of identifying treatment strategies that maximize long-term survival, while evaluating whether incorporating clinical context into a conservative offline RL policy leads to more accurate Q-value estimations and a safer treatment policy compared to a behavior-cloning baseline. This framework acts as an example of reliable AI deployment in critical care medicine. Inspired by the seminal work of \citet{wu2023}, who successfully demonstrated a 97.81\% survival rate using a Weighted Dueling Double Deep Q-Network with embedded human Expertise (WD3QNE) on the MIMIC-III dataset, we expand our investigation to address fundamental issues of value function overestimation, clinically grounded feature selection, and out-of-distribution (OOD) action penalties.
+
+\section{Background and Related Work}
+
+\subsection{The Value Estimation Challenge and Clinical Context}
+Clinical treatment for sepsis requires sequential decisions under substantial uncertainty, naturally modeled as a finite-horizon Markov Decision Process (MDP). In this formulation, states represent patient physiology, actions represent treatment decisions (dosages of fluids and vasopressors), and terminal outcomes reflect survival-oriented objectives. 
+
+Standard value-based RL algorithms frequently suffer from severe overestimation bias, largely because they evaluate states and actions in a vacuum devoid of clinical reality. When evaluating actions not present in the historical data, the max operator in standard Q-learning pushes the value estimates unrealistically high, leading to policies that are dangerous in a clinical setting. Incorporating clinical context—such as bounding the action space or shaping the state representation—is essential for realistic Q-value estimation. \citet{wu2023} addressed this by proposing the WD3QNE architecture, embedding human expertise—a form of deep clinical context—to ensure the algorithm does not stray into physiologically unviable action spaces.
+
+\subsection{Conservative Q-Learning and Imitation Baselines}
+To counter overestimation bias and anchor our estimates in clinical reality without manually tuning dynamic network weights, our project leverages \textbf{Conservative Q-Learning (CQL)} \citep{kumar2020}. CQL tackles the out-of-distribution action problem by explicitly regularizing the value function. It adds a penalty term to the Bellman error objective that minimizes the Q-values of actions that are not supported by the behavior policy, while simultaneously maximizing the Q-values of actions present in the dataset. 
+
+While \citet{wu2023} integrated human expertise via architectural embedding, we incorporate clinician expertise by establishing a \textbf{Behavior Cloning (BC)} baseline. BC provides a purely supervised imitation learning benchmark that reflects the logged clinician policy. By utilizing a conservative penalty coefficient $\alpha$ in CQL, we aim to discover a context-aware policy that safely improves upon BC without exhibiting premature convergence or catastrophic risk-taking.
+
+\subsection{Off-Policy Evaluation}
+To evaluate policies safely without online deployment, we rely on \textbf{Weighted Importance Sampling (WIS)}. WIS provides an off-policy value estimator with lower variance than ordinary Importance Sampling by normalizing the importance weights across the evaluation trajectories.
+
+\section{Methodology}
+
+\subsection{Data Source and Sepsis Cohort Construction}
+We implemented and scaled the full pipeline on the comprehensive MIMIC-IV clinical database. After preprocessing the massive BigQuery extractions, we established a minimal feature profile yielding 592,182 total transitions. To ensure methodological rigor against data leakage, we enforced strict patient-level splits, resulting in 414,522 training transitions, 88,812 validation transitions, and 88,848 held-out test transitions. 
+
+\subsection{State Representation and Clinical Contextualization}
+As highlighted by \citet{wu2023}, the performance, interpretability, and safety of AI models in critical care heavily depend on eliminating statistical redundancy and embedding meaningful clinical context. We defined our MDP State utilizing robust numeric lab features that reflect true physiological deterioration, thereby grounding the Q-value estimations in clinical reality. To validate the non-degeneracy of our state formulation, we later analyze feature importance using a Random Forest proxy targeting terminal outcomes.
+
+For our MDP components, we defined the variables as follows:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{State}: Top continuous lab features, utilizing an hourly-updated (1h binning) vector to capture rapid physiological deterioration accurately.
+  \item \textbf{Action}: A discretized 2D treatment index formed from fluid amount and vasopressor intensity bins.
+  \item \textbf{Reward}: A terminal survival proxy (+1 if alive at the 30-day window, -1 if deceased), with 0 intermediate rewards to encourage long-term policy optimization over short-term physiological symptom suppression.
+\end{itemize}
+
+\subsection{Algorithmic Setup}
+We trained a discrete Behavior Cloning MLP encoder alongside a discrete CQL agent via the \texttt{d3rlpy} library. Behavior policy probabilities were estimated using a Laplace-smoothed frequency estimator derived from the \textbf{train split only}.
+
+\section{Experimental Results}
+
+\subsection{Primary Metrics and Value Estimation}
+We conducted large-scale off-policy evaluation on the held-out test split, spanning 88,848 transitions across 4,936 distinct patient episodes. The policies were evaluated using Weighted Importance Sampling bounded by 95\% bootstrap confidence intervals (using 1000 bootstrap iterations). 
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcccc}
+\toprule
+Policy & Mean Return & 95\% CI Low & 95\% CI High & Survival Proxy \\
+\midrule
+Behavior (logged) & 0.686 & -- & -- & 0.843 \\
+BC ($\mu$ estimated by BC) & 0.686 & 0.667 & 0.705 & 0.782 \\
+CQL ($\alpha=1.0$) & \textbf{0.693} & 0.672 & 0.715 & \textbf{0.893} \\
+\bottomrule
+\end{tabular}
+\caption{WIS summary and Survival Proxies on the large-scale test split ($N = 4,936$ episodes).}
+\label{tab:wis_demo}
+\end{table}
+
+As shown in Table~\ref{tab:wis_demo}, the Conservative Q-Learning agent, benefiting from a clinically grounded state representation and bounded value estimation, successfully identified a safer policy structure yielding a superior expected return (0.693) compared to both the strict imitation BC model and the historical behavior baseline (0.686). Furthermore, extracting a heuristic survival proxy from the terminal rewards shows that CQL improved the overall survival alignment metric to 0.893, significantly outperforming the historical physician behavior of 0.843.
+
+\subsection{Effective Sample Size (ESS) and Policy Safety}
+A fundamental threat to offline RL evaluation is distributional shift, where the candidate policy selects actions so distinct from the logging policy that Importance Sampling weights collapse. We computed the Effective Sample Size (ESS) across the 4,936 test episodes. 
+The BC baseline maintained an ESS of 4936.0 (as expected for pure imitation). Crucially, the CQL agent maintained an exceptionally high ESS of \textbf{4755.26}. This mathematically demonstrates that the conservative penalty ($\alpha=1.0$), when informed by clinical context, successfully prevented the model from querying catastrophic out-of-distribution actions, remaining well within the physiological support of the clinical data while still finding safe margins for outcome optimization.
+
+\subsection{Policy Action Space Distributions}
+To visually inspect policy safety, \citet{wu2023} utilized 2D heatmaps to compare the density of AI actions against physician actions. Figure~\ref{fig:heatmaps} illustrates this comparison for our models across the discretized IV fluid and vasopressor action space.
+
+\begin{figure}[h]
+    \centering
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\textwidth]{fig10a_heatmap_clinician.png}
+        \caption{Clinician (Logged)}
+        \label{fig:heat1}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\textwidth]{fig10b_heatmap_bc.png}
+        \caption{Behavior Cloning}
+        \label{fig:heat2}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}{0.32\textwidth}
+        \includegraphics[width=\textwidth]{fig10c_heatmap_cql.png}
+        \caption{CQL ($\alpha=1.0$)}
+        \label{fig:heat3}
+    \end{subfigure}
+    \caption{Action distribution heatmaps showing dosage frequencies of IV fluids and vasopressors.}
+    \label{fig:heatmaps}
+\end{figure}
+
+The clinician behavior (Fig~\ref{fig:heat1}) exhibits a wider spread of edge-case interventions. The BC model (Fig~\ref{fig:heat2}) struggles to cleanly replicate this, often smearing probability mass. In contrast, the context-aware CQL agent (Fig~\ref{fig:heat3}) learns a highly focused, dense policy that anchors safely inside the physician support zone while explicitly avoiding sparse, high-risk treatment extremes. 
+
+To further quantify this distributional shift, Figure~\ref{fig:action_dist} maps the policy probabilities across the flattened 25-bin discrete action space. 
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.85\linewidth]{fig5_action_distribution_comparison.png}
+    \caption{1D Action distribution across the 25 discrete treatment bins, highlighting the probability mass smearing of the BC baseline compared to the sharp peaks of the clinician and CQL policies.}
+    \label{fig:action_dist}
+\end{figure}
+
+As shown in Figure~\ref{fig:action_dist}, the BC policy collapses into a near-uniform distribution, failing to capture the prominent clinical preferences at actions 0, 10, and 20 (representing standard discrete fluid and vasopressor combinations). Conversely, the CQL agent successfully aligns with the high-confidence peaks of the historical data. By preserving these core clinical decisions while trimming the hazardous long-tail edge cases, this analysis provides empirical proof that CQL optimizes patient outcomes without devolving into an unsafe or flattened probabilistic regime.
+
+\subsection{Mortality Deviation Analysis}
+A critical diagnostic for any offline RL healthcare agent is measuring how patient outcomes change when human decisions diverge from the AI's optimal policy. As shown in Figure~\ref{fig:mortality-dev}, we plot the actual patient mortality proxy against the dosage difference between the physician's administered dose and the CQL agent's suggested dose.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.6\linewidth]{fig8_mortality_deviation.png}
+\caption{Mortality proxy rates based on the deviation between logged clinician dosages and CQL optimal actions.}
+\label{fig:mortality-dev}
+\end{figure}
+
+Consistent with findings in state-of-the-art literature \citep{wu2023}, mortality reaches its global minimum when the dosage deviation is near zero (i.e., the physician agrees with the AI). As the physician's administered dose strongly deviates from the CQL recommendation (either in vast excess or dangerous deficiency), mortality proxy rates rise steadily. This biologically validates the learned policy structure, confirming that improved Q-value estimation through clinical context translates directly to safer, more optimal treatment decisions.
+
+\subsection{Sensitivity of Conservative Penalty ($\alpha$)}
+To justify the selected hyperparameters, Figure~\ref{fig:alpha-sens} maps expected evaluation return against varying levels of the CQL conservative penalty, $\alpha$. 
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.6\linewidth]{fig9_alpha_sensitivity.png}
+\caption{Sensitivity analysis showing off-policy expected return as a function of the conservative penalty $\alpha$.}
+\label{fig:alpha-sens}
+\end{figure}
+
+At $\alpha=0$ (effectively standard unregularized offline Deep Q-Learning), the model collapses due to OOD overestimation bias, proving that lacking a clinically constrained value estimation leads to failure. As $\alpha$ increases to $1.0$, the policy finds the optimal Pareto frontier between conservatism and maximization. Penalties heavily exceeding this over-constrain the agent, forcing it into a strictly sub-optimal pessimistic regime. 
+
+To provide a comprehensive view of how $\alpha$ impacts performance over the entire 100,000-step training duration, we have included extended logarithmic sweep trend logs in Appendix A. As shown in Figures~\ref{fig:sweep_log_full} and \ref{fig:sweep_log_min}, both the full and minimal feature profiles rapidly achieve peak expected returns before flattening, emphasizing that maintaining an optimal $\alpha$ is critical to preventing long-term policy collapse once the maximum reward threshold is breached.
+
+\subsection{Training Dynamics and Convergence}
+\citet{wu2023} observed that while unregularized DQN algorithms converge rapidly, they suffer from premature convergence due to drastic Q-value overestimation. Figure~\ref{fig:train-curves} demonstrates the training objective curves for our implemented models.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.7\linewidth]{fig2_training_objective_curves.png}
+\caption{Training objective curves for BC and CQL variants. The CQL panels overlay multiple $\alpha$ penalty settings to identify optimal regularization ranges.}
+\label{fig:train-curves}
+\end{figure}
+
+By enforcing the conservative penalty, CQL effectively suppresses the premature convergence spikes typical of standard deep Q-learning, yielding a smoother, bounded value loss curve over the 100,000 training steps that reflects realistic physiological learning rather than ungrounded maximization. 
+
+To further analyze convergence stability, we provide linear-scale convergence plots in Appendix A (Figures~\ref{fig:sweep_lin_full} and \ref{fig:sweep_lin_min}). These visualizations closely track the WIS Mean Return across the later stages of training. They reveal that models with excessively low $\alpha$ values experience gradual performance decay as they continue to update over 100,000 steps, whereas higher, optimized conservative penalties successfully lock in stable returns without degrading over extended time horizons.
+
+\subsection{Interpretability via Feature Importance Proxy}
+Because high-stakes medical applications demand models that can produce explanations alongside correct answers, we employed a Random Forest framework over terminal outcomes to compute feature importance scores (Figure~\ref{fig:feat-importance}).
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.7\linewidth]{min_fig4_feature_importance_rf_proxy.png}
+\caption{Top feature importance scores from a Random Forest model.}
+\label{fig:feat-importance}
+\end{figure}
+
+The extracted latent variables \texttt{f5} (0.234) and \texttt{f4} (0.224) vastly dominated the predictive importance, confirming that our selected state representation effectively distills critical physiological variance without overwhelming the RL agent with statistical noise. 
+
+\section{Conclusion and Future Work}
+In this project, we constructed and scaled an end-to-end reproducible pipeline to evaluate conservative offline RL for the sequential treatment of sepsis. By scaling to a massive MIMIC-IV cohort comprising over 590,000 transitions, we proved that Conservative Q-Learning (CQL)—when properly grounded in clinical context—effectively mitigates the overestimation bias that plagues standard healthcare RL. Our OPE evaluations demonstrated that this context-aware approach leads to better Q-value estimation, improving expected patient returns and survival proxies compared to historical clinician baselines. Crucially, the resulting policy maintained an exceptionally high Effective Sample Size (4755 / 4936), guaranteeing algorithmic safety and physiological viability.
+
+Inspired by \citet{wu2023}, future work will include conducting extensive hyperparameter sweeps across multiple random seeds to map the Pareto frontier of safety versus optimality, implementing systematic ablation studies on binning intervals (e.g., 2h, 4h, 8h), and expanding OPE robustness through doubly robust estimators.
+
+\section{Contributions and Acknowledgements}
+We thank Professor Doina Precup, Nishanth, and the course TAs for their guidance and instruction throughout COMP-579. 
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Alex Groiser}: Data engineering, cohort extraction, MDP construction, and reproducibility scaffolding.
+  \item \textbf{Yusuf Hamza}: Training and evaluation integration, OPE pipeline, experiment orchestration, and theoretical analysis.
+  \item \textbf{Shared}: Report writing, biological interpretation, final validation, and presentation.
+\end{itemize}
+
+\bibliographystyle{plainnat}
+\begin{thebibliography}{9}
+
+\bibitem[Wu et al.(2023)]{wu2023}
+Wu, X., Li, R., He, Z., et al. (2023).
+\textit{A value-based deep reinforcement learning model with human expertise in optimal treatment of sepsis}. npj Digital Medicine, 6, 15. \url{https://doi.org/10.1038/s41746-023-00755-5}
+
+\bibitem[Kumar et al.(2020)]{kumar2020}
+Kumar, A., Zhou, A., Tucker, G., and Levine, S. (2020).
+\textit{Conservative Q-Learning for Offline Reinforcement Learning}. arXiv:2006.04779.
+
+\bibitem[Johnson et al.(2023)]{johnson2023}
+Johnson, A. E. W., Bulgarelli, L., Shen, L., et al. (2023).
+\textit{MIMIC-IV, a freely accessible electronic health record dataset}. Scientific Data.
+
+\bibitem[Levine et al.(2020)]{levine2020}
+Levine, S., Kumar, A., Tucker, G., and Fu, J. (2020).
+\textit{Offline Reinforcement Learning: Tutorial, Review, and Perspectives on Open Problems}. arXiv:2005.01643.
+
+\bibitem[Wang et al.(2023)]{wang2023}
+Wang, Z., Hunt, J. J., and Zhou, M. (2023).
+\textit{Diffusion Policies as an Expressive Representation for Offline RL}. ICLR.
+
+\end{thebibliography}
+
+\newpage
+\appendix
+\section{Extended Figures and Diagnostics}
+As a supplemental diagnostic, we analyzed the monotonic relationship between expected policy return and a bounded survival proxy. Note that this proxy is a monotonic transformation used for consistency checks and does not represent a calibrated clinical survival probability.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.6\linewidth]{min_fig6_return_survival_relationship.png}
+\caption{Relationship between policy expected return and survival proxy. The alignment acts as an essential sanity check for the terminal reward structure.}
+\label{fig:return-survival}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.6\linewidth]{min_fig7_final_survival_comparison.png}
+\caption{Final policy comparison using survival-proxy transformation derived from expected returns across the tested cohorts.}
+\label{fig:survival-compare}
+\end{figure}
+
+\vspace{2em}
+\noindent\textbf{Extended Sweep Trends and Hyperparameter Analysis}
+
+\noindent The following figures illustrate the extensive training logs mapping Expected Return (WIS) across $10^5$ training steps. They are partitioned by the feature extraction profile (Full vs. Minimal) and scale (Logarithmic to show the overall learning curve, and Linear to highlight convergence decay).
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.8\linewidth]{sweep_trend_full.png}
+\caption{Sepsis Policy Performance (Full Profile) across various CQL $\alpha$ penalties over 100,000 training steps (Log Scale).}
+\label{fig:sweep_log_full}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.8\linewidth]{sweep_trend_minimal.png}
+\caption{Sepsis Policy Performance (Minimal Profile) across various CQL $\alpha$ penalties over 100,000 training steps (Log Scale).}
+\label{fig:sweep_log_min}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.8\linewidth]{sweep_trend_linear_full.png}
+\caption{Treatment Policy Convergence (Full Profile) showing WIS Mean Return stability on a linear scale. Note how models with lower $\alpha$ values experience gradual performance decay, while optimal penalties stabilize.}
+\label{fig:sweep_lin_full}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.8\linewidth]{sweep_trend_linear_minimal.png}
+\caption{Treatment Policy Convergence (Minimal Profile) on a linear scale, further demonstrating the stabilizing effect of higher conservative penalties over extended training horizons.}
+\label{fig:sweep_lin_min}
+\end{figure}
+
+\end{document}

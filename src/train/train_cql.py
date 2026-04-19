@@ -20,15 +20,25 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--n-steps", type=int, default=1000)
     parser.add_argument("--eval-interval", type=int, default=100)
     parser.add_argument("--alpha", type=float, default=1.0)
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--model-arch", type=str, choices=["mlp", "dueling"], default="mlp")
     return parser.parse_args()
 
 
-def _build_cql_config(d3rlpy_module, batch_size: int, alpha: float):
+def _build_cql_config(d3rlpy_module, batch_size: int, alpha: float, gamma: float, model_arch: str):
     config_class = d3rlpy_module.algos.DiscreteCQLConfig
+    arch_kwargs = {}
+    if model_arch == "dueling":
+        from src.train.dueling_q import DuelingQFunctionFactory
+
+        arch_kwargs = {"q_func_factory": DuelingQFunctionFactory()}
+
     candidate_kwargs = [
-        {"alpha": alpha, "batch_size": batch_size},
-        {"conservative_weight": alpha, "batch_size": batch_size},
-        {"batch_size": batch_size},
+        {"alpha": alpha, "batch_size": batch_size, "gamma": gamma, **arch_kwargs},
+        {"conservative_weight": alpha, "batch_size": batch_size, "gamma": gamma, **arch_kwargs},
+        {"alpha": alpha, "batch_size": batch_size, **arch_kwargs},
+        {"conservative_weight": alpha, "batch_size": batch_size, **arch_kwargs},
+        {"batch_size": batch_size, **arch_kwargs},
     ]
     for kwargs in candidate_kwargs:
         try:
@@ -74,6 +84,16 @@ def _fit_algo(
         except TypeError:
             continue
     raise RuntimeError("Unable to call algo.fit with known d3rlpy signatures.")
+
+
+def _make_jsonable_kwargs(kwargs: dict) -> dict:
+    out = {}
+    for k, v in kwargs.items():
+        if isinstance(v, (str, int, float, bool)) or v is None:
+            out[k] = v
+        else:
+            out[k] = str(v)
+    return out
 
 
 def _find_new_log_dir(before: set[Path], pattern: str, log_root: Path) -> Path | None:
@@ -138,14 +158,22 @@ def main() -> None:
 
     dataset = _load_dataset(args.dataset_h5, args.dataset_npz)
 
-    config, used_kwargs = _build_cql_config(d3rlpy, batch_size=args.batch_size, alpha=args.alpha)
+    config, used_kwargs = _build_cql_config(
+        d3rlpy,
+        batch_size=args.batch_size,
+        alpha=args.alpha,
+        gamma=args.gamma,
+        model_arch=args.model_arch,
+    )
     algo = config.create(device=args.device)
 
     run_dir = args.out_dir / f"alpha_{args.alpha:g}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # Deterministic naming avoids race conditions across fast alpha/step sweeps.
-    experiment_name = f"CQL_alpha_{args.alpha:g}_steps_{args.n_steps}_seed_{args.seed}"
+    experiment_name = (
+        f"CQL_{args.model_arch}_alpha_{args.alpha:g}_gamma_{args.gamma:g}_steps_{args.n_steps}_seed_{args.seed}"
+    )
     run_log_root = run_dir / "d3rlpy_logs"
     run_log_root.mkdir(parents=True, exist_ok=True)
 
@@ -162,6 +190,7 @@ def main() -> None:
         log_root=run_log_root,
     )
     fit_kwargs_summary = {k: v for k, v in fit_kwargs_used.items() if k != "dataset"}
+    config_kwargs_summary = _make_jsonable_kwargs(used_kwargs)
 
     log_dir = _find_new_log_dir(before=before_run_logs, pattern="*CQL*", log_root=run_log_root)
     if log_dir is None:
@@ -173,7 +202,10 @@ def main() -> None:
         )
 
     model_path = run_dir / "cql_model.d3"
-    algo.save_model(str(model_path))
+    # Save architecture + weights for robust reload across custom Q-function factories.
+    algo.save(str(model_path))
+    # Also keep a raw state_dict for debugging/legacy inspection.
+    algo.save_model(str(run_dir / "cql_model_state.pt"))
 
     metrics = {
         "algorithm": "DiscreteCQL",
@@ -182,7 +214,9 @@ def main() -> None:
         "batch_size": args.batch_size,
         "n_steps": args.n_steps,
         "alpha_requested": args.alpha,
-        "config_kwargs_used": used_kwargs,
+        "gamma_requested": args.gamma,
+        "model_arch": args.model_arch,
+        "config_kwargs_used": config_kwargs_summary,
         "fit_kwargs_used": fit_kwargs_summary,
         "experiment_name": experiment_name,
         "requested_log_root": str(run_log_root),
