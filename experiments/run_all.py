@@ -39,6 +39,28 @@ def _seeded_dir(base_dir: str, seed: int, multi_seed: bool) -> str:
     return f"{base_dir}/seed_{seed}"
 
 
+def _in_shard(idx: int, shard_count: int, shard_index: int) -> bool:
+    if shard_count <= 1:
+        return True
+    return (idx % shard_count) == shard_index
+
+
+def _cleanup_cql_artifacts(model_path: Path, cleanup_enabled: bool, dry_run: bool) -> None:
+    if not cleanup_enabled:
+        return
+
+    sidecar = model_path.with_name("cql_model_state.pt")
+    targets = [model_path, sidecar]
+    for target in targets:
+        if not target.exists():
+            continue
+        if dry_run:
+            print(f"[cleanup-dry-run] Would delete: {target}")
+            continue
+        print(f"[cleanup] Deleting: {target}")
+        target.unlink()
+
+
 def _aggregate_seed_wis_jsons(seed_json_paths: list[Path], out_json: Path, seeds: list[int]) -> None:
     valid_paths = [p for p in seed_json_paths if p.exists()]
     if not valid_paths:
@@ -152,7 +174,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cql-architectures",
         type=str,
-        default="mlp",
+        default="mlp,dueling",
         help="Comma-separated CQL model architectures to train (e.g. mlp,dueling).",
     )
     parser.add_argument(
@@ -190,12 +212,49 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Seed to use for report model-path selection. Defaults to first seed from --seeds.",
     )
+    parser.add_argument(
+        "--sweep-shard-count",
+        type=int,
+        default=1,
+        help="Split sweep configs across N shards (for parallel jobs).",
+    )
+    parser.add_argument(
+        "--sweep-shard-index",
+        type=int,
+        default=0,
+        help="0-based shard index to run when --sweep-shard-count > 1.",
+    )
+    parser.add_argument(
+        "--stream-train-eval",
+        action="store_true",
+        help="Interleave CQL train and WIS eval per config to reduce peak storage usage.",
+    )
+    parser.add_argument(
+        "--cleanup-cql-after-wis",
+        action="store_true",
+        help="Delete CQL .d3 and sidecar state file immediately after successful WIS eval.",
+    )
+    parser.add_argument(
+        "--cleanup-dry-run",
+        action="store_true",
+        help="Print which CQL artifacts would be deleted without actually deleting them.",
+    )
+    parser.add_argument(
+        "--skip-report-assets",
+        action="store_true",
+        help="Skip build_report_assets in this run (useful for sweep shards).",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
     root = Path(__file__).resolve().parents[1]
+
+    if args.sweep_shard_count < 1:
+        raise ValueError("--sweep-shard-count must be >= 1")
+    if args.sweep_shard_index < 0 or args.sweep_shard_index >= args.sweep_shard_count:
+        raise ValueError("--sweep-shard-index must be in [0, --sweep-shard-count).")
 
     mode_flags = [args.use_fhir, args.use_icu_sepsis, args.use_bigquery, args.use_mimic_profiles]
     if sum(1 for x in mode_flags if x) > 1:
@@ -209,7 +268,9 @@ def main() -> None:
     ope_csv = "outputs/data/mock_ope_table.csv"
     wis_json = "outputs/ope/wis_summary.json"
     summary_json = "outputs/data/mock_summary.json"
-    aggregate_jobs: list[tuple[Path, list[Path], list[int]]] = []
+    aggregate_jobs_map: dict[Path, tuple[list[Path], list[int]]] = {}
+    post_aggregate_steps: list[list[str]] = []
+    models_to_keep: set[Path] = set()
 
     if args.use_mimic_profiles:
         selected_profiles = [args.profile] if args.profile in {"minimal", "full"} else ["minimal", "full"]
@@ -315,6 +376,24 @@ def main() -> None:
 
             report_cql_dir = _seeded_dir(_arch_root(cql_dir, report_arch), report_seed, multi_seed)
             cql_model = f"{report_cql_dir}/steps_{report_steps}/gamma_{report_gamma:g}/alpha_{report_alpha:g}/cql_model.d3"
+            models_to_keep.add((root / Path(cql_model)).resolve())
+
+            ordered_pairs = sorted(training_pairs, key=lambda x: (x[0], x[2], x[1]))
+            all_runs = [(arch, s, a, g) for arch in architectures for (s, a, g) in ordered_pairs]
+            selected_runs = [
+                run
+                for idx, run in enumerate(all_runs)
+                if _in_shard(idx=idx, shard_count=args.sweep_shard_count, shard_index=args.sweep_shard_index)
+            ]
+            selected_pairs_report_arch = sorted(
+                {(s, a, g) for (arch, s, a, g) in selected_runs if arch == report_arch},
+                key=lambda x: (x[0], x[2], x[1]),
+            )
+
+            print(
+                f"[sweep] profile={profile} total-runs={len(all_runs)} "
+                f"selected-runs={len(selected_runs)} shard={args.sweep_shard_index}/{args.sweep_shard_count}"
+            )
 
             steps.append(
                 [
@@ -349,80 +428,92 @@ def main() -> None:
                             str(args.bc_steps),
                         ]
                     )
-                for arch in architectures:
+                for arch, step_count, alpha, gamma in selected_runs:
                     cql_arch_dir = _arch_root(cql_dir, arch)
-                    for step_count in step_sweep:
-                        for seed in seeds:
-                            seed_cql_root = _seeded_dir(cql_arch_dir, seed, multi_seed)
-                            cql_step_dir = f"{seed_cql_root}/steps_{step_count}"
-                            for gamma in gammas:
-                                cql_gamma_dir = f"{cql_step_dir}/gamma_{gamma:g}"
-                                for alpha in refinement_alphas:
-                                    steps.append(
-                                        [
-                                            args.python,
-                                            "-m",
-                                            "src.train.train_cql",
-                                            "--dataset-h5",
-                                            dataset_h5,
-                                            "--dataset-npz",
-                                            dataset_npz,
-                                            "--out-dir",
-                                            cql_gamma_dir,
-                                            "--alpha",
-                                            str(alpha),
-                                            "--gamma",
-                                            str(gamma),
-                                            "--model-arch",
-                                            arch,
-                                            "--seed",
-                                            str(seed),
-                                            "--n-steps",
-                                            str(step_count),
-                                            "--eval-interval",
-                                            str(args.cql_eval_interval),
-                                        ]
-                                    )
-                # Add targeted long-horizon runs for selected alphas.
-                for arch in architectures:
-                    cql_arch_dir = _arch_root(cql_dir, arch)
-                    for step_count in long_steps:
-                        for seed in seeds:
-                            seed_cql_root = _seeded_dir(cql_arch_dir, seed, multi_seed)
-                            cql_step_dir = f"{seed_cql_root}/steps_{step_count}"
-                            for gamma in gammas:
-                                cql_gamma_dir = f"{cql_step_dir}/gamma_{gamma:g}"
-                                for alpha in long_alphas:
-                                    if (int(step_count), float(alpha), float(gamma)) in base_pairs:
-                                        continue
-                                    steps.append(
-                                        [
-                                            args.python,
-                                            "-m",
-                                            "src.train.train_cql",
-                                            "--dataset-h5",
-                                            dataset_h5,
-                                            "--dataset-npz",
-                                            dataset_npz,
-                                            "--out-dir",
-                                            cql_gamma_dir,
-                                            "--alpha",
-                                            str(alpha),
-                                            "--gamma",
-                                            str(gamma),
-                                            "--model-arch",
-                                            arch,
-                                            "--seed",
-                                            str(seed),
-                                            "--n-steps",
-                                            str(step_count),
-                                            "--eval-interval",
-                                            str(args.cql_eval_interval),
-                                        ]
-                                    )
+                    for seed in seeds:
+                        seed_cql_root = _seeded_dir(cql_arch_dir, seed, multi_seed)
+                        cql_gamma_dir = f"{seed_cql_root}/steps_{step_count}/gamma_{gamma:g}"
+                        steps.append(
+                            [
+                                args.python,
+                                "-m",
+                                "src.train.train_cql",
+                                "--dataset-h5",
+                                dataset_h5,
+                                "--dataset-npz",
+                                dataset_npz,
+                                "--out-dir",
+                                cql_gamma_dir,
+                                "--alpha",
+                                str(alpha),
+                                "--gamma",
+                                str(gamma),
+                                "--model-arch",
+                                arch,
+                                "--seed",
+                                str(seed),
+                                "--n-steps",
+                                str(step_count),
+                                "--eval-interval",
+                                str(args.cql_eval_interval),
+                            ]
+                        )
 
+                        if args.stream_train_eval and mu_source == "bc_model" and arch == report_arch:
+                            alpha_tag = _float_tag(alpha)
+                            gamma_tag = _float_tag(gamma)
+                            canonical_wis_json = Path(
+                                f"outputs/ope/mimic_mdp_{profile}_wis_s{step_count}_a{alpha_tag}_g{gamma_tag}.json"
+                            )
+                            seed_wis_json = Path(
+                                f"outputs/ope/mimic_mdp_{profile}_wis_s{step_count}_a{alpha_tag}_g{gamma_tag}_seed{seed}.json"
+                            )
+                            seed_bc_model = f"{_seeded_dir(bc_dir, seed, multi_seed)}/bc_model.d3"
+                            model_path = f"{seed_cql_root}/steps_{step_count}/gamma_{gamma:g}/alpha_{alpha:g}/cql_model.d3"
+
+                            steps.append(
+                                [
+                                    args.python,
+                                    "-m",
+                                    "src.ope.wis_eval",
+                                    "--in-csv",
+                                    ope_csv,
+                                    "--out-json",
+                                    str(seed_wis_json),
+                                    "--mu-source",
+                                    "bc_model",
+                                    "--dataset-npz",
+                                    dataset_npz,
+                                    "--bc-model",
+                                    seed_bc_model,
+                                    "--cql-model",
+                                    model_path,
+                                    "--seed",
+                                    str(seed),
+                                    "--sync-bc-prob-with-mu",
+                                ]
+                            )
+
+                            existing = aggregate_jobs_map.get(canonical_wis_json)
+                            if existing is None:
+                                aggregate_jobs_map[canonical_wis_json] = ([seed_wis_json], seeds)
+                            else:
+                                existing[0].append(seed_wis_json)
+
+            report_pair_available = True
             if mu_source == "bc_model":
-                for step_count, alpha, gamma in sorted(training_pairs, key=lambda x: (x[0], x[2], x[1])):
+                eval_pairs = selected_pairs_report_arch if args.sweep_shard_count > 1 else ordered_pairs
+                if args.stream_train_eval and not args.skip_train:
+                    # WIS steps were already interleaved right after CQL training.
+                    eval_pairs = []
+
+                report_pair_available = (
+                    (report_steps, report_alpha, report_gamma) in set(selected_pairs_report_arch)
+                    if args.sweep_shard_count > 1
+                    else True
+                )
+
+                for step_count, alpha, gamma in eval_pairs:
                     alpha_tag = _float_tag(alpha)
                     gamma_tag = _float_tag(gamma)
                     canonical_wis_json = Path(
@@ -462,7 +553,7 @@ def main() -> None:
                             ]
                         )
 
-                    aggregate_jobs.append((canonical_wis_json, seed_json_paths, seeds))
+                    aggregate_jobs_map[canonical_wis_json] = (seed_json_paths, seeds)
                 wis_json = (
                     f"outputs/ope/mimic_mdp_{profile}_wis_s{report_steps}_a{_float_tag(report_alpha)}_g{_float_tag(report_gamma)}.json"
                 )
@@ -485,35 +576,42 @@ def main() -> None:
                 ]
                 steps.append(wis_step)
 
-            steps.append(
-                [
-                    args.python,
-                    "-m",
-                    "src.ope.build_report_assets",
-                    "--summary-json",
-                    summary_json,
-                    "--wis-json",
-                    wis_json,
-                    "--ope-csv",
-                    ope_csv,
-                    "--dataset-npz",
-                    dataset_npz,
-                    "--bc-metrics-json",
-                    f"{report_bc_dir}/train_metrics.json",
-                    "--cql-dir",
-                    report_cql_dir,
-                    "--bc-model",
-                    bc_model,
-                    "--cql-model",
-                    cql_model,
-                    "--out-json",
-                    f"report/generated/{profile}_report_metrics.json",
-                    "--out-table",
-                    f"report/generated/{profile}_results_table.tex",
-                    "--fig-dir",
-                    f"report/generated/figures/{profile}",
-                ]
-            )
+            if not args.skip_report_assets:
+                if not report_pair_available:
+                    print(
+                        f"[report] Skipping report asset generation for profile={profile} on shard "
+                        f"{args.sweep_shard_index}: report config not in this shard."
+                    )
+                else:
+                    post_aggregate_steps.append(
+                        [
+                            args.python,
+                            "-m",
+                            "src.ope.build_report_assets",
+                            "--summary-json",
+                            summary_json,
+                            "--wis-json",
+                            wis_json,
+                            "--ope-csv",
+                            ope_csv,
+                            "--dataset-npz",
+                            dataset_npz,
+                            "--bc-metrics-json",
+                            f"{report_bc_dir}/train_metrics.json",
+                            "--cql-dir",
+                            report_cql_dir,
+                            "--bc-model",
+                            bc_model,
+                            "--cql-model",
+                            cql_model,
+                            "--out-json",
+                            f"report/generated/{profile}_report_metrics.json",
+                            "--out-table",
+                            f"report/generated/{profile}_results_table.tex",
+                            "--fig-dir",
+                            f"report/generated/figures/{profile}",
+                        ]
+                    )
     elif args.use_icu_sepsis:
         dataset_npz = "outputs/data/icu_sepsis_mdp_raw.npz"
         dataset_h5 = "outputs/data/icu_sepsis_mdp_dataset.h5"
@@ -862,9 +960,25 @@ def main() -> None:
     for cmd in steps:
         _run(cmd, cwd=root)
 
-    for out_json, seed_jsons, seeds in aggregate_jobs:
+        if args.cleanup_cql_after_wis and "src.ope.wis_eval" in cmd and "--cql-model" in cmd:
+            model_arg_idx = cmd.index("--cql-model") + 1
+            model_path = Path(cmd[model_arg_idx])
+            model_abs = (root / model_path).resolve()
+            if model_abs in models_to_keep:
+                print(f"[cleanup] Keeping report/reference model: {model_abs}")
+            else:
+                _cleanup_cql_artifacts(
+                    model_path=model_abs,
+                    cleanup_enabled=True,
+                    dry_run=args.cleanup_dry_run,
+                )
+
+    for out_json, (seed_jsons, seeds) in sorted(aggregate_jobs_map.items(), key=lambda x: str(x[0])):
         print("Aggregating seed WIS:", str(out_json))
         _aggregate_seed_wis_jsons(seed_json_paths=seed_jsons, out_json=out_json, seeds=seeds)
+
+    for cmd in post_aggregate_steps:
+        _run(cmd, cwd=root)
 
     print("Pipeline complete. Outputs are under finalProj/outputs")
 

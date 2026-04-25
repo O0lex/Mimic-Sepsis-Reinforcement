@@ -14,12 +14,29 @@ set -eo pipefail
 
 cd /home/2023/agrois1/comp579/Mimic-Sepsis-Reinforcement
 
-# 1. Use the working module names we verified earlier
 module load cuda/cuda-12.6
+module load miniconda/fall-2025  # This provides the shared conda base
 
-# 2. Use the proper way to activate conda in a script
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate comp579_env
+# 2. Use the system-wide environment (No quota cost!)
+# Replace 'comp579_env' with the shared name or the path provided by your TA
+# If they didn't give a name, you can often use 'base' or the path:
+source /etc/profile.d/conda.sh
+conda activate base 
 
-# 3. Execute the master sweep
-python -m experiments.run_all "$@"
+
+# 3. Execute the master sweep with your agent's new logic
+ARCH_MODE="${ARCH_MODE:-both}"
+REPORT_ARCH_OVERRIDE="${REPORT_ARCH_OVERRIDE:-}"
+
+case "$ARCH_MODE" in
+    both)    CQL_ARCHS="mlp,dueling"; DEFAULT_REPORT_ARCH="mlp" ;;
+    mlp)     CQL_ARCHS="mlp";         DEFAULT_REPORT_ARCH="mlp" ;;
+    dueling) CQL_ARCHS="dueling";     DEFAULT_REPORT_ARCH="dueling" ;;
+    *) echo "Error: Unsupported ARCH_MODE"; exit 2 ;;
+esac
+
+# Pass all arguments from sbatch to the python script
+python -m experiments.run_all \
+    --cql-architectures "$CQL_ARCHS" \
+    --report-arch "${REPORT_ARCH_OVERRIDE:-$DEFAULT_REPORT_ARCH}" \
+    "$@"

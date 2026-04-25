@@ -11,6 +11,7 @@ import pandas as pd
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.ticker import ScalarFormatter
 from sklearn.ensemble import RandomForestClassifier
 
 from src.common.io import ensure_parent, write_json
@@ -116,9 +117,74 @@ def _parse_int_list(raw: str) -> list[int]:
     return vals
 
 
+def _infer_architecture_token(text: str) -> str | None:
+    low = str(text).lower()
+
+    # Explicit tags first.
+    tagged = re.search(r"(?:^|[\\/._-])arch[_-]?(mlp|dueling)(?:$|[\\/._-])", low)
+    if tagged:
+        return str(tagged.group(1))
+
+    # Fallbacks for paths that include architecture names without arch_ prefix.
+    if "dueling" in low:
+        return "dueling"
+    if "mlp" in low:
+        return "mlp"
+    return None
+
+
+def _infer_architecture(path: Path, payload: dict) -> str:
+    # Prefer model metadata when present (most reliable).
+    for key in ["cql_model", "cql_model_path", "model_path"]:
+        val = payload.get(key)
+        if val:
+            found = _infer_architecture_token(str(val))
+            if found is not None:
+                return found
+
+    # Fall back to filename/path inspection.
+    found = _infer_architecture_token(path.name)
+    if found is not None:
+        return found
+    found = _infer_architecture_token(str(path))
+    if found is not None:
+        return found
+    return "unspecified"
+
+
+def _arch_token(arch: str) -> str:
+    token = re.sub(r"[^a-z0-9]+", "_", str(arch).lower()).strip("_")
+    return token if token else "unspecified"
+
+
+def _arch_label(arch: str) -> str:
+    token = _arch_token(arch)
+    if token == "mlp":
+        return "MLP"
+    if token == "dueling":
+        return "Dueling"
+    if token == "unspecified":
+        return "Unspecified"
+    return token
+
+
+def _set_reasonable_y_limits(ax, values: list[float]) -> None:
+    finite = [float(v) for v in values if np.isfinite(v)]
+    if not finite:
+        return
+
+    y_min = min(finite)
+    y_max = max(finite)
+    if np.isclose(y_min, y_max):
+        pad = max(0.02, abs(y_min) * 0.05 if not np.isclose(y_min, 0.0) else 0.05)
+    else:
+        pad = max(0.01, (y_max - y_min) * 0.08)
+    ax.set_ylim(y_min - pad, y_max + pad)
+
+
 def _parse_wis_filename(path: Path) -> dict | None:
     m = re.search(
-        r"mimic_mdp_(?P<profile>full|minimal)_wis_s(?P<steps>\d+)_a(?P<alpha>[\d_]+)(?:_g(?P<gamma>[\d_]+))?\.json$",
+        r"mimic_mdp_(?P<profile>full|minimal)_wis_s(?P<steps>\d+)_a(?P<alpha>[\d_]+)(?:_g(?P<gamma>[\d_]+))?(?:_arch_(?P<arch>[a-zA-Z0-9_\-]+))?\.json$",
         path.name,
     )
     if not m:
@@ -129,16 +195,19 @@ def _parse_wis_filename(path: Path) -> dict | None:
     alpha = float(str(m.group("alpha")).replace("_", "."))
     gamma_group = m.group("gamma")
     gamma = float(str(gamma_group).replace("_", ".")) if gamma_group else 0.99
+    arch_group = m.group("arch")
+    architecture = _arch_token(str(arch_group)) if arch_group else None
     return {
         "profile": profile,
         "steps": steps,
         "alpha": alpha,
         "gamma": gamma,
+        "architecture": architecture,
     }
 
 
 def _collect_sweep_index(search_dirs: list[Path]) -> pd.DataFrame:
-    dedup: dict[tuple[str, int, float, float], dict] = {}
+    dedup: dict[tuple[str, str, int, float, float], dict] = {}
 
     for root in search_dirs:
         if not root.exists() or not root.is_dir():
@@ -152,9 +221,13 @@ def _collect_sweep_index(search_dirs: list[Path]) -> pd.DataFrame:
             except Exception:
                 continue
 
+            architecture = info.get("architecture") or _infer_architecture(path=path, payload=payload)
+            architecture = _arch_token(architecture)
+
             ci = payload.get("cql_wis_ci95") or [None, None]
             row = {
                 "profile": info["profile"],
+                "architecture": architecture,
                 "steps": int(info["steps"]),
                 "alpha": float(info["alpha"]),
                 "gamma": float(info["gamma"]),
@@ -168,7 +241,7 @@ def _collect_sweep_index(search_dirs: list[Path]) -> pd.DataFrame:
                 "mtime": float(path.stat().st_mtime),
             }
 
-            key = (row["profile"], row["steps"], row["alpha"], row["gamma"])
+            key = (row["profile"], row["architecture"], row["steps"], row["alpha"], row["gamma"])
             prev = dedup.get(key)
             if prev is None or float(row["mtime"]) > float(prev["mtime"]):
                 dedup[key] = row
@@ -177,7 +250,7 @@ def _collect_sweep_index(search_dirs: list[Path]) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.DataFrame(list(dedup.values()))
-    df = df.sort_values(["profile", "steps", "gamma", "alpha"]).reset_index(drop=True)
+    df = df.sort_values(["profile", "architecture", "steps", "gamma", "alpha"]).reset_index(drop=True)
     return df
 
 
@@ -206,75 +279,95 @@ def _resolve_feature_names(summary: dict, dataset_npz: Path, state_dim: int) -> 
     return [f"f{i}" for i in range(state_dim)]
 
 
-def _plot_sweep_linear(df: pd.DataFrame, profile: str, fig_dir: Path) -> Path | None:
+def _plot_sweep_linear(df: pd.DataFrame, profile: str, fig_dir: Path, arch: str) -> Path | None:
     if df.empty:
         return None
 
-    fig, ax = plt.subplots(figsize=(11.5, 6.5))
+    fig, ax = plt.subplots(figsize=(12.0, 6.5))
+    y_vals: list[float] = []
+    steps_sorted = sorted({int(s) for s in pd.to_numeric(df["steps"], errors="coerce").dropna().astype(int).tolist() if int(s) > 0})
     alphas = sorted(df["alpha"].dropna().unique().tolist())
     for alpha in alphas:
         adf = df[df["alpha"] == alpha].sort_values("steps")
         if adf.empty:
             continue
-        ax.plot(adf["steps"], adf["cql_wis_mean"], marker="o", linewidth=1.8, label=f"alpha={alpha:g}")
+        ys = pd.to_numeric(adf["cql_wis_mean"], errors="coerce").to_numpy(dtype=np.float64)
+        y_vals.extend(ys[np.isfinite(ys)].tolist())
+        ax.plot(adf["steps"], ys, marker="o", linewidth=1.8, label=f"alpha={alpha:g}")
 
     baseline = float(df["behavior_episode_return"].dropna().mean()) if df["behavior_episode_return"].notna().any() else None
     if baseline is not None:
+        y_vals.append(baseline)
         ax.axhline(y=baseline, color="red", linestyle="--", alpha=0.65, label="Clinician baseline")
 
-    ax.set_xlabel("Training Steps (linear)")
+    if steps_sorted:
+        ax.set_xticks(steps_sorted)
+        ax.set_xlim(min(steps_sorted) * 0.95, max(steps_sorted) * 1.05)
+
+    _set_reasonable_y_limits(ax, y_vals)
+    ax.set_xlabel("Training Steps")
     ax.set_ylabel("WIS Mean Return")
-    ax.set_title(f"Sweep Trend ({profile.capitalize()} profile)")
+    ax.set_title(f"Sweep Trend ({profile.capitalize()} profile, {_arch_label(arch)})")
     ax.grid(True, linestyle=":", alpha=0.5)
-    ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False, fontsize=8)
+    ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False, fontsize=8, ncol=1 if len(alphas) <= 8 else 2)
     fig.tight_layout()
 
-    out_path = fig_dir / f"sweep_trend_linear_{profile}.png"
+    out_path = fig_dir / f"sweep_trend_linear_{profile}_arch_{_arch_token(arch)}.png"
     fig.savefig(out_path, dpi=170)
     plt.close(fig)
     return out_path
 
 
-def _plot_sweep_log(df: pd.DataFrame, profile: str, fig_dir: Path) -> Path | None:
+def _plot_sweep_log(df: pd.DataFrame, profile: str, fig_dir: Path, arch: str) -> Path | None:
     if df.empty:
         return None
 
-    fig, ax = plt.subplots(figsize=(11.5, 6.5))
+    fig, ax = plt.subplots(figsize=(12.0, 6.5))
+    y_vals: list[float] = []
+    steps_sorted = sorted({int(s) for s in pd.to_numeric(df["steps"], errors="coerce").dropna().astype(int).tolist() if int(s) > 0})
     alphas = sorted(df["alpha"].dropna().unique().tolist())
     for alpha in alphas:
         adf = df[df["alpha"] == alpha].sort_values("steps")
         if adf.empty:
             continue
-        ax.plot(adf["steps"], adf["cql_wis_mean"], marker="o", linewidth=1.8, label=f"alpha={alpha:g}")
+        ys = pd.to_numeric(adf["cql_wis_mean"], errors="coerce").to_numpy(dtype=np.float64)
+        y_vals.extend(ys[np.isfinite(ys)].tolist())
+        ax.plot(adf["steps"], ys, marker="o", linewidth=1.8, label=f"alpha={alpha:g}")
 
     baseline = float(df["behavior_episode_return"].dropna().mean()) if df["behavior_episode_return"].notna().any() else None
     if baseline is not None:
+        y_vals.append(baseline)
         ax.axhline(y=baseline, color="red", linestyle="--", alpha=0.65, label="Clinician baseline")
 
+    _set_reasonable_y_limits(ax, y_vals)
     ax.set_xscale("log")
+    if steps_sorted:
+        ax.set_xticks(steps_sorted)
+        ax.get_xaxis().set_major_formatter(ScalarFormatter())
+        ax.get_xaxis().set_minor_formatter(plt.NullFormatter())
     ax.set_xlabel("Training Steps (log scale)")
     ax.set_ylabel("WIS Mean Return")
-    ax.set_title(f"Sweep Trend ({profile.capitalize()} profile)")
+    ax.set_title(f"Sweep Trend ({profile.capitalize()} profile, {_arch_label(arch)})")
     ax.grid(True, linestyle=":", alpha=0.5)
-    ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False, fontsize=8)
+    ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False, fontsize=8, ncol=1 if len(alphas) <= 8 else 2)
     fig.tight_layout()
 
-    out_path = fig_dir / f"sweep_trend_{profile}.png"
+    out_path = fig_dir / f"sweep_trend_{profile}_arch_{_arch_token(arch)}.png"
     fig.savefig(out_path, dpi=170)
     plt.close(fig)
     return out_path
 
 
-def _plot_sweep_heatmap(df: pd.DataFrame, profile: str, fig_dir: Path) -> Path | None:
+def _plot_sweep_heatmap(df: pd.DataFrame, profile: str, fig_dir: Path, arch: str) -> Path | None:
     if df.empty:
         return None
     pivot = df.pivot_table(index="steps", columns="alpha", values="cql_wis_mean", aggfunc="mean")
     if pivot.empty:
         return None
 
-    fig, ax = plt.subplots(figsize=(8.6, 5.2))
+    fig, ax = plt.subplots(figsize=(9.2, 5.4))
     im = ax.imshow(pivot.values, aspect="auto", cmap="viridis", origin="lower")
-    ax.set_title(f"WIS Heatmap ({profile.capitalize()})")
+    ax.set_title(f"WIS Heatmap ({profile.capitalize()}, {_arch_label(arch)})")
     ax.set_xlabel("Alpha")
     ax.set_ylabel("Steps")
     ax.set_xticks(np.arange(pivot.shape[1]))
@@ -285,13 +378,13 @@ def _plot_sweep_heatmap(df: pd.DataFrame, profile: str, fig_dir: Path) -> Path |
     cbar.set_label("CQL WIS Mean")
     fig.tight_layout()
 
-    out_path = fig_dir / f"fig11_sweep_heatmap_{profile}.png"
+    out_path = fig_dir / f"fig11_sweep_heatmap_{profile}_arch_{_arch_token(arch)}.png"
     fig.savefig(out_path, dpi=170)
     plt.close(fig)
     return out_path
 
 
-def _plot_algorithm_means(df: pd.DataFrame, profile: str, fig_dir: Path) -> Path | None:
+def _plot_algorithm_means(df: pd.DataFrame, profile: str, fig_dir: Path, arch: str) -> Path | None:
     if df.empty:
         return None
 
@@ -308,11 +401,11 @@ def _plot_algorithm_means(df: pd.DataFrame, profile: str, fig_dir: Path) -> Path
     fig, ax = plt.subplots(figsize=(6.2, 4.2))
     ax.bar(names, arr, color=["#7f7f7f", "#1f77b4", "#d62728"], alpha=0.9)
     ax.set_ylabel("Mean Return")
-    ax.set_title(f"Mean Return by Algorithm ({profile.capitalize()})")
+    ax.set_title(f"Mean Return ({profile.capitalize()}, {_arch_label(arch)})")
     ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
 
-    out_path = fig_dir / f"fig12_mean_return_algorithms_{profile}.png"
+    out_path = fig_dir / f"fig12_mean_return_algorithms_{profile}_arch_{_arch_token(arch)}.png"
     fig.savefig(out_path, dpi=170)
     plt.close(fig)
     return out_path
@@ -334,61 +427,65 @@ def _build_sweep_artifacts(args: argparse.Namespace) -> dict:
     figures: dict[str, str] = {}
 
     for profile in sorted(df["profile"].unique().tolist()):
-        pdf = df[df["profile"] == profile].copy()
-        if pdf.empty:
-            continue
+        for arch in sorted(df[df["profile"] == profile]["architecture"].unique().tolist()):
+            pdf = df[(df["profile"] == profile) & (df["architecture"] == arch)].copy()
+            if pdf.empty:
+                continue
 
-        # Keep plotting readable by selecting the most common gamma slice.
-        gamma_mode = float(pdf["gamma"].mode().iloc[0]) if not pdf["gamma"].empty else 0.99
-        plot_df = pdf[pdf["gamma"] == gamma_mode].copy()
-        if plot_df.empty:
-            plot_df = pdf
+            # Keep plotting readable by selecting the most common gamma slice.
+            gamma_mode = float(pdf["gamma"].mode().iloc[0]) if not pdf["gamma"].empty else 0.99
+            plot_df = pdf[pdf["gamma"] == gamma_mode].copy()
+            if plot_df.empty:
+                plot_df = pdf
 
-        best_row = plot_df.loc[plot_df["cql_wis_mean"].astype(float).idxmax()]
-        ci_ready = plot_df.dropna(subset=["cql_ci_low"])
-        best_ci_row = ci_ready.loc[ci_ready["cql_ci_low"].astype(float).idxmax()] if not ci_ready.empty else None
+            best_row = plot_df.loc[plot_df["cql_wis_mean"].astype(float).idxmax()]
+            ci_ready = plot_df.dropna(subset=["cql_ci_low"])
+            best_ci_row = ci_ready.loc[ci_ready["cql_ci_low"].astype(float).idxmax()] if not ci_ready.empty else None
 
-        check_alphas = alpha_target if alpha_target else sorted(plot_df["alpha"].unique().tolist())
-        existing = {(int(r.steps), float(r.alpha)) for r in plot_df[["steps", "alpha"]].itertuples(index=False)}
-        missing = [{"steps": int(s), "alpha": float(a)} for s in steps_target for a in check_alphas if (int(s), float(a)) not in existing]
+            check_alphas = alpha_target if alpha_target else sorted(plot_df["alpha"].unique().tolist())
+            existing = {(int(r.steps), float(r.alpha)) for r in plot_df[["steps", "alpha"]].itertuples(index=False)}
+            missing = [{"steps": int(s), "alpha": float(a)} for s in steps_target for a in check_alphas if (int(s), float(a)) not in existing]
 
-        log_fig = _plot_sweep_log(plot_df, profile=profile, fig_dir=args.fig_dir)
-        line_fig = _plot_sweep_linear(plot_df, profile=profile, fig_dir=args.fig_dir)
-        heat_fig = _plot_sweep_heatmap(plot_df, profile=profile, fig_dir=args.fig_dir)
-        mean_fig = _plot_algorithm_means(plot_df, profile=profile, fig_dir=args.fig_dir)
+            # Pass the arch parameter correctly to prevent crashes
+            log_fig = _plot_sweep_log(plot_df, profile=profile, fig_dir=args.fig_dir, arch=arch)
+            line_fig = _plot_sweep_linear(plot_df, profile=profile, fig_dir=args.fig_dir, arch=arch)
+            heat_fig = _plot_sweep_heatmap(plot_df, profile=profile, fig_dir=args.fig_dir, arch=arch)
+            mean_fig = _plot_algorithm_means(plot_df, profile=profile, fig_dir=args.fig_dir, arch=arch)
 
-        if log_fig is not None:
-            figures[f"sweep_trend_{profile}"] = str(log_fig)
-        if line_fig is not None:
-            figures[f"sweep_trend_linear_{profile}"] = str(line_fig)
-        if heat_fig is not None:
-            figures[f"fig11_sweep_heatmap_{profile}"] = str(heat_fig)
-        if mean_fig is not None:
-            figures[f"fig12_mean_return_algorithms_{profile}"] = str(mean_fig)
+            if log_fig is not None:
+                figures[f"sweep_trend_{profile}_{arch}"] = str(log_fig)
+            if line_fig is not None:
+                figures[f"sweep_trend_linear_{profile}_{arch}"] = str(line_fig)
+            if heat_fig is not None:
+                figures[f"fig11_sweep_heatmap_{profile}_{arch}"] = str(heat_fig)
+            if mean_fig is not None:
+                figures[f"fig12_mean_return_algorithms_{profile}_{arch}"] = str(mean_fig)
 
-        profiles[profile] = {
-            "gamma_selected_for_plots": gamma_mode,
-            "n_points": int(plot_df.shape[0]),
-            "best_mean": {
-                "steps": int(best_row["steps"]),
-                "alpha": float(best_row["alpha"]),
-                "gamma": float(best_row["gamma"]),
-                "cql_wis_mean": float(best_row["cql_wis_mean"]),
-                "file_path": str(best_row["file_path"]),
-            },
-            "best_ci_low": (
-                {
-                    "steps": int(best_ci_row["steps"]),
-                    "alpha": float(best_ci_row["alpha"]),
-                    "gamma": float(best_ci_row["gamma"]),
-                    "cql_ci_low": float(best_ci_row["cql_ci_low"]),
-                    "file_path": str(best_ci_row["file_path"]),
-                }
-                if best_ci_row is not None
-                else None
-            ),
-            "missing_grid": missing,
-        }
+            profile_arch_key = f"{profile}_{arch}"
+            profiles[profile_arch_key] = {
+                "architecture": arch,
+                "gamma_selected_for_plots": gamma_mode,
+                "n_points": int(plot_df.shape[0]),
+                "best_mean": {
+                    "steps": int(best_row["steps"]),
+                    "alpha": float(best_row["alpha"]),
+                    "gamma": float(best_row["gamma"]),
+                    "cql_wis_mean": float(best_row["cql_wis_mean"]),
+                    "file_path": str(best_row["file_path"]),
+                },
+                "best_ci_low": (
+                    {
+                        "steps": int(best_ci_row["steps"]),
+                        "alpha": float(best_ci_row["alpha"]),
+                        "gamma": float(best_ci_row["gamma"]),
+                        "cql_ci_low": float(best_ci_row["cql_ci_low"]),
+                        "file_path": str(best_ci_row["file_path"]),
+                    }
+                    if best_ci_row is not None
+                    else None
+                ),
+                "missing_grid": missing,
+            }
 
     return {
         "index_csv": str(args.sweep_index_csv),
@@ -1212,20 +1309,40 @@ def main() -> None:
         }
     write_json(args.out_json, merged)
 
-    table = "\n".join(
-        [
-            "\\begin{tabular}{lccc}",
-            "\\toprule",
-            "Policy & Mean Return & 95\\% CI Low & 95\\% CI High \\\\",
-            "\\midrule",
-            f"Behavior ({wis.get('eval_split', 'all')} split) & {wis['behavior_episode_return']:.3f} & -- & -- \\\\",
-            f"BC & {wis['bc_wis_mean']:.3f} & {wis['bc_wis_ci95'][0]:.3f} & {wis['bc_wis_ci95'][1]:.3f} \\\\",
-            f"CQL & {wis['cql_wis_mean']:.3f} & {wis['cql_wis_ci95'][0]:.3f} & {wis['cql_wis_ci95'][1]:.3f} \\\\",
-            "\\bottomrule",
-            "\\end{tabular}",
-            "",
-        ]
-    )
+    table_lines = [
+        "\\begin{tabular}{lccc}",
+        "\\toprule",
+        "Policy & Mean Return & 95\\% CI Low & 95\\% CI High \\\\",
+        "\\midrule",
+        f"Behavior ({wis.get('eval_split', 'all')} split) & {wis['behavior_episode_return']:.3f} & -- & -- \\\\",
+        f"BC & {wis['bc_wis_mean']:.3f} & {wis['bc_wis_ci95'][0]:.3f} & {wis['bc_wis_ci95'][1]:.3f} \\\\",
+    ]
+
+    # Dynamically extract the highest performing model for each architecture
+    df_sweep = pd.read_csv(args.sweep_index_csv) if args.sweep_index_csv.exists() else pd.DataFrame()
+    if not df_sweep.empty:
+        for arch in df_sweep["architecture"].unique():
+            arch_df = df_sweep[df_sweep["architecture"] == arch]
+            best_idx = arch_df["cql_wis_mean"].astype(float).idxmax()
+            best_row = arch_df.loc[best_idx]
+            
+            table_lines.append(
+                f"CQL ({arch.upper()}, $\\alpha$={best_row['alpha']}, s={best_row['steps']}) & "
+                f"{float(best_row['cql_wis_mean']):.3f} & "
+                f"{float(best_row['cql_ci_low']):.3f} & "
+                f"{float(best_row['cql_ci_high']):.3f} \\\\"
+            )
+    else:
+         table_lines.append(f"CQL & {wis['cql_wis_mean']:.3f} & {wis['cql_wis_ci95'][0]:.3f} & {wis['cql_wis_ci95'][1]:.3f} \\\\")
+
+    table_lines.extend([
+        "\\bottomrule",
+        "\\end{tabular}",
+        ""
+    ])
+    
+    table = "\n".join(table_lines)
+    
     ensure_parent(args.out_table)
     args.out_table.write_text(table, encoding="utf-8")
 

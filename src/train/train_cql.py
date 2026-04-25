@@ -16,7 +16,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, default=Path("outputs/models/cql"))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--n-steps", type=int, default=1000)
     parser.add_argument("--eval-interval", type=int, default=100)
     parser.add_argument("--alpha", type=float, default=1.0)
