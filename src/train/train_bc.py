@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 import numpy as np
@@ -15,7 +16,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-npz", type=Path, default=Path("outputs/data/mock_mdp_raw.npz"))
     parser.add_argument("--out-dir", type=Path, default=Path("outputs/models/bc"))
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--device", type=str, default=os.getenv("D3RLPY_DEVICE", "cpu"))
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--n-steps", type=int, default=1000)
     parser.add_argument("--eval-interval", type=int, default=100)
@@ -77,6 +78,22 @@ def _load_dataset(h5_path: Path, npz_path: Path):
     )
 
 
+def _resolve_device(requested_device: str) -> str:
+    raw = str(requested_device or "cpu").strip().lower()
+    if raw.startswith("cuda"):
+        try:
+            import torch
+        except ImportError:
+            print("Warning: requested CUDA device but torch is unavailable; falling back to CPU.")
+            return "cpu"
+
+        if not torch.cuda.is_available():
+            print(f"Warning: requested device '{requested_device}' but CUDA is unavailable; falling back to CPU.")
+            return "cpu"
+
+    return raw
+
+
 def main() -> None:
     args = _parse_args()
 
@@ -89,8 +106,10 @@ def main() -> None:
 
     dataset = _load_dataset(args.dataset_h5, args.dataset_npz)
 
+    resolved_device = _resolve_device(args.device)
+
     config = d3rlpy.algos.DiscreteBCConfig(batch_size=args.batch_size)
-    algo = config.create(device=args.device)
+    algo = config.create(device=resolved_device)
 
     log_root = Path("d3rlpy_logs")
     before_logs = set(log_root.glob("DiscreteBC_*")) if log_root.exists() else set()
@@ -104,7 +123,8 @@ def main() -> None:
     metrics = {
         "algorithm": "DiscreteBC",
         "seed": args.seed,
-        "device": args.device,
+        "device_requested": args.device,
+        "device": resolved_device,
         "batch_size": args.batch_size,
         "n_steps": args.n_steps,
         "dataset_h5": str(args.dataset_h5),

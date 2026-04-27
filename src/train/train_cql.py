@@ -150,6 +150,22 @@ def _load_dataset(h5_path: Path, npz_path: Path):
     )
 
 
+def _resolve_device(requested_device: str) -> str:
+    raw = str(requested_device or "cpu").strip().lower()
+    if raw.startswith("cuda"):
+        try:
+            import torch
+        except ImportError:
+            print("Warning: requested CUDA device but torch is unavailable; falling back to CPU.")
+            return "cpu"
+
+        if not torch.cuda.is_available():
+            print(f"Warning: requested device '{requested_device}' but CUDA is unavailable; falling back to CPU.")
+            return "cpu"
+
+    return raw
+
+
 def main() -> None:
     args = _parse_args()
     set_seed(args.seed)
@@ -168,7 +184,8 @@ def main() -> None:
         gamma=args.gamma,
         model_arch=args.model_arch,
     )
-    algo = config.create(device=args.device)
+    resolved_device = _resolve_device(args.device)
+    algo = config.create(device=resolved_device)
 
     run_dir = args.out_dir / f"alpha_{args.alpha:g}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -213,7 +230,8 @@ def main() -> None:
     metrics = {
         "algorithm": "DiscreteCQL",
         "seed": args.seed,
-        "device": args.device,
+        "device_requested": args.device,
+        "device": resolved_device,
         "batch_size": args.batch_size,
         "n_steps": args.n_steps,
         "alpha_requested": args.alpha,
