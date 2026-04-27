@@ -4,9 +4,12 @@ import argparse
 from pathlib import Path
 
 import numpy as np
+import os
 
 from src.common.io import write_json
 from src.common.seed import set_seed
+
+
 
 
 def _parse_args() -> argparse.Namespace:
@@ -15,7 +18,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-npz", type=Path, default=Path("outputs/data/mock_mdp_raw.npz"))
     parser.add_argument("--out-dir", type=Path, default=Path("outputs/models/cql"))
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--device", type=str, default=os.getenv("D3RLPY_DEVICE", "cpu"))
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--n-steps", type=int, default=1000)
     parser.add_argument("--eval-interval", type=int, default=100)

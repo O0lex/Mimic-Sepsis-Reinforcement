@@ -14,14 +14,14 @@ set -eo pipefail
 
 cd /home/2023/agrois1/comp579/Mimic-Sepsis-Reinforcement
 
-module load cuda/cuda-12.6
+# --- ENVIRONMENT SETUP ---
 module load miniconda/fall-2025  # This provides the shared conda base
+module load cuda/cuda-11.8  # Matches the version in your nvidia-smi output
+export D3RLPY_DEVICE="cuda:0"
+export PYTHONPATH=$PYTHONPATH:$(pwd)
 
-# 2. Use the system-wide environment (No quota cost!)
-# Replace 'comp579_env' with the shared name or the path provided by your TA
-# If they didn't give a name, you can often use 'base' or the path:
-source /etc/profile.d/conda.sh
-conda activate base 
+
+export PYTHONPATH="$HOME/.local/lib/python3.13/site-packages:$PYTHONPATH"
 
 
 # 3. Execute the master sweep with your agent's new logic

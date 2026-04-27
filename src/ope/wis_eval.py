@@ -9,6 +9,9 @@ import pandas as pd
 from src.common.io import write_json
 from src.common.seed import set_seed
 
+import os
+DEVICE = os.getenv("D3RLPY_DEVICE", "cpu")
+
 
 def _build_d3_dataset_from_npz(npz_path: Path):
     try:
@@ -49,6 +52,7 @@ def _predict_logged_probs_bc(
     dataset,
     bc_model_path: Path,
     batch_size: int,
+    device: str,
 ) -> np.ndarray:
     try:
         import d3rlpy
@@ -56,7 +60,13 @@ def _predict_logged_probs_bc(
     except ImportError as exc:
         raise RuntimeError("d3rlpy and torch are required for BC-based mu estimation.") from exc
 
-    algo = d3rlpy.algos.DiscreteBCConfig().create(device="cpu")
+    requested_device = str(device or DEVICE)
+    if requested_device.startswith("cuda") and not torch.cuda.is_available():
+        print(f"Warning: requested device '{requested_device}' but CUDA is unavailable; falling back to CPU.")
+        requested_device = "cpu"
+    torch_device = torch.device(requested_device)
+
+    algo = d3rlpy.algos.DiscreteBCConfig().create(device=requested_device)
     algo.build_with_dataset(dataset)
     algo.load_model(str(bc_model_path))
 
@@ -75,7 +85,7 @@ def _predict_logged_probs_bc(
 
     for start in range(0, n, max(1, batch_size)):
         end = min(n, start + max(1, batch_size))
-        obs_t = torch.tensor(observations[start:end], dtype=torch.float32)
+        obs_t = torch.as_tensor(observations[start:end], dtype=torch.float32, device=torch_device)
         with torch.no_grad():
             dist_or_logits = imitator(obs_t)
 
@@ -102,6 +112,7 @@ def _predict_logged_probs_cql(
     cql_model_path: Path,
     temperature: float,
     batch_size: int,
+    device: str,
 ) -> np.ndarray:
     try:
         import d3rlpy
@@ -112,12 +123,18 @@ def _predict_logged_probs_cql(
     # Register custom Q-function factories (e.g., dueling) for load_learnable deserialization.
     from src.train import dueling_q  # noqa: F401
 
+    requested_device = str(device or DEVICE)
+    if requested_device.startswith("cuda") and not torch.cuda.is_available():
+        print(f"Warning: requested device '{requested_device}' but CUDA is unavailable; falling back to CPU.")
+        requested_device = "cpu"
+    torch_device = torch.device(requested_device)
+
     algo = None
     try:
-        algo = d3rlpy.load_learnable(str(cql_model_path), device="cpu")
+        algo = d3rlpy.load_learnable(str(cql_model_path), device=requested_device)
     except Exception:
         # Backward compatibility with legacy artifacts saved via save_model.
-        algo = d3rlpy.algos.DiscreteCQLConfig(alpha=1.0).create(device="cpu")
+        algo = d3rlpy.algos.DiscreteCQLConfig(alpha=1.0).create(device=requested_device)
         algo.build_with_dataset(dataset)
         algo.load_model(str(cql_model_path))
 
@@ -132,7 +149,7 @@ def _predict_logged_probs_cql(
 
     for start in range(0, n, max(1, batch_size)):
         end = min(n, start + max(1, batch_size))
-        obs_t = torch.tensor(observations[start:end], dtype=torch.float32)
+        obs_t = torch.as_tensor(observations[start:end], dtype=torch.float32, device=torch_device)
         with torch.no_grad():
             q = q_forwarder.compute_expected_q(obs_t)
             probs_t = torch.softmax(q / temp, dim=1)
@@ -223,6 +240,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--cql-temperature", type=float, default=1.0)
     parser.add_argument("--prob-batch-size", type=int, default=2048)
     parser.add_argument("--sync-bc-prob-with-mu", action="store_true")
+    parser.add_argument("--device", type=str, default=DEVICE)
     return parser.parse_args()
 
 
@@ -260,6 +278,7 @@ def main() -> None:
             dataset=dataset,
             bc_model_path=args.bc_model,
             batch_size=args.prob_batch_size,
+            device=args.device,
         )
         df["mu_prob"] = bc_mu
 
@@ -276,6 +295,7 @@ def main() -> None:
                 cql_model_path=args.cql_model,
                 temperature=args.cql_temperature,
                 batch_size=args.prob_batch_size,
+                device=args.device,
             )
             df["cql_prob"] = cql_probs
 
@@ -313,6 +333,7 @@ def main() -> None:
         "dataset_npz": str(args.dataset_npz) if args.dataset_npz is not None else None,
         "bc_model": str(args.bc_model) if args.bc_model is not None else None,
         "cql_model": str(args.cql_model) if args.cql_model is not None else None,
+        "device": args.device,
     }
 
     if args.out_csv is not None:

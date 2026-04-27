@@ -9,9 +9,13 @@ import matplotlib
 import numpy as np
 import pandas as pd
 
+import os
+
+DEVICE = os.getenv("D3RLPY_DEVICE", "cpu")
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.ticker import ScalarFormatter
+from matplotlib.ticker import NullFormatter, ScalarFormatter
 from sklearn.ensemble import RandomForestClassifier
 
 from src.common.io import ensure_parent, write_json
@@ -344,7 +348,7 @@ def _plot_sweep_log(df: pd.DataFrame, profile: str, fig_dir: Path, arch: str) ->
     if steps_sorted:
         ax.set_xticks(steps_sorted)
         ax.get_xaxis().set_major_formatter(ScalarFormatter())
-        ax.get_xaxis().set_minor_formatter(plt.NullFormatter())
+        ax.get_xaxis().set_minor_formatter(NullFormatter())
     ax.set_xlabel("Training Steps (log scale)")
     ax.set_ylabel("WIS Mean Return")
     ax.set_title(f"Sweep Trend ({profile.capitalize()} profile, {_arch_label(arch)})")
@@ -427,10 +431,13 @@ def _build_sweep_artifacts(args: argparse.Namespace) -> dict:
     figures: dict[str, str] = {}
 
     for profile in sorted(df["profile"].unique().tolist()):
+        profile_arches_seen: list[str] = []
         for arch in sorted(df[df["profile"] == profile]["architecture"].unique().tolist()):
             pdf = df[(df["profile"] == profile) & (df["architecture"] == arch)].copy()
             if pdf.empty:
                 continue
+            arch_tok = _arch_token(arch)
+            profile_arches_seen.append(arch_tok)
 
             # Keep plotting readable by selecting the most common gamma slice.
             gamma_mode = float(pdf["gamma"].mode().iloc[0]) if not pdf["gamma"].empty else 0.99
@@ -453,17 +460,17 @@ def _build_sweep_artifacts(args: argparse.Namespace) -> dict:
             mean_fig = _plot_algorithm_means(plot_df, profile=profile, fig_dir=args.fig_dir, arch=arch)
 
             if log_fig is not None:
-                figures[f"sweep_trend_{profile}_{arch}"] = str(log_fig)
+                figures[f"sweep_trend_{profile}_{arch_tok}"] = str(log_fig)
             if line_fig is not None:
-                figures[f"sweep_trend_linear_{profile}_{arch}"] = str(line_fig)
+                figures[f"sweep_trend_linear_{profile}_{arch_tok}"] = str(line_fig)
             if heat_fig is not None:
-                figures[f"fig11_sweep_heatmap_{profile}_{arch}"] = str(heat_fig)
+                figures[f"fig11_sweep_heatmap_{profile}_{arch_tok}"] = str(heat_fig)
             if mean_fig is not None:
-                figures[f"fig12_mean_return_algorithms_{profile}_{arch}"] = str(mean_fig)
+                figures[f"fig12_mean_return_algorithms_{profile}_{arch_tok}"] = str(mean_fig)
 
-            profile_arch_key = f"{profile}_{arch}"
+            profile_arch_key = f"{profile}_{arch_tok}"
             profiles[profile_arch_key] = {
-                "architecture": arch,
+                "architecture": arch_tok,
                 "gamma_selected_for_plots": gamma_mode,
                 "n_points": int(plot_df.shape[0]),
                 "best_mean": {
@@ -486,6 +493,15 @@ def _build_sweep_artifacts(args: argparse.Namespace) -> dict:
                 ),
                 "missing_grid": missing,
             }
+
+        # Backward compatibility for report templates that expect profile-only sweep keys.
+        if profile_arches_seen:
+            preferred_arch = "mlp" if "mlp" in profile_arches_seen else profile_arches_seen[0]
+            for base_name in ["sweep_trend", "sweep_trend_linear", "fig11_sweep_heatmap", "fig12_mean_return_algorithms"]:
+                src = f"{base_name}_{profile}_{preferred_arch}"
+                dst = f"{base_name}_{profile}"
+                if src in figures and dst not in figures:
+                    figures[dst] = figures[src]
 
     return {
         "index_csv": str(args.sweep_index_csv),
@@ -573,7 +589,7 @@ def _predict_bc_probs_all_actions(observations: np.ndarray, dataset, bc_model: P
     import d3rlpy
     import torch
 
-    algo = d3rlpy.algos.DiscreteBCConfig().create(device="cpu")
+    algo = d3rlpy.algos.DiscreteBCConfig().create(device=DEVICE)
     algo.build_with_dataset(dataset)
     algo.load_model(str(bc_model))
 
@@ -617,10 +633,10 @@ def _predict_cql_probs_all_actions(
 
     algo = None
     try:
-        algo = d3rlpy.load_learnable(str(cql_model), device="cpu")
+        algo = d3rlpy.load_learnable(str(cql_model), device=DEVICE)
     except Exception:
         # Backward compatibility with legacy artifacts saved via save_model.
-        algo = d3rlpy.algos.DiscreteCQLConfig(alpha=1.0).create(device="cpu")
+        algo = d3rlpy.algos.DiscreteCQLConfig(alpha=1.0).create(device=DEVICE)
         algo.build_with_dataset(dataset)
         algo.load_model(str(cql_model))
 
