@@ -41,9 +41,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sweep-search-dirs",
         type=str,
-        default="outputs/ope,outsideshit/ope best results,outsideshit/ope best results/all training curves",
+        default="outputs/ope",
         help="Comma-separated directories scanned for mimic_mdp_*_wis_s*_a*.json files.",
     )
+    parser.add_argument("--device", type=str, default=DEVICE)
     parser.add_argument(
         "--sweep-steps-target",
         type=str,
@@ -585,11 +586,29 @@ def _build_d3_dataset(npz_path: Path):
     return dataset, arrays
 
 
-def _predict_bc_probs_all_actions(observations: np.ndarray, dataset, bc_model: Path, batch_size: int) -> np.ndarray:
+def _resolve_runtime_device(requested_device: str) -> tuple[str, "object"]:
+    import torch
+
+    raw = str(requested_device or "cpu").strip().lower()
+    if raw.startswith("cuda") and not torch.cuda.is_available():
+        print(f"Warning: requested device '{requested_device}' but CUDA is unavailable; falling back to CPU.")
+        raw = "cpu"
+    return raw, torch.device(raw)
+
+
+def _predict_bc_probs_all_actions(
+    observations: np.ndarray,
+    dataset,
+    bc_model: Path,
+    batch_size: int,
+    device: str,
+) -> np.ndarray:
     import d3rlpy
     import torch
 
-    algo = d3rlpy.algos.DiscreteBCConfig().create(device=DEVICE)
+    d3rlpy_device, torch_device = _resolve_runtime_device(device)
+
+    algo = d3rlpy.algos.DiscreteBCConfig().create(device=d3rlpy_device)
     algo.build_with_dataset(dataset)
     algo.load_model(str(bc_model))
 
@@ -603,7 +622,7 @@ def _predict_bc_probs_all_actions(observations: np.ndarray, dataset, bc_model: P
     out = []
     for start in range(0, observations.shape[0], max(1, batch_size)):
         end = min(observations.shape[0], start + max(1, batch_size))
-        x = torch.tensor(observations[start:end], dtype=torch.float32)
+        x = torch.as_tensor(observations[start:end], dtype=torch.float32, device=torch_device)
         with torch.no_grad():
             y = imitator(x)
         if hasattr(y, "probs"):
@@ -624,6 +643,7 @@ def _predict_cql_probs_all_actions(
     cql_model: Path,
     temperature: float,
     batch_size: int,
+    device: str,
 ) -> np.ndarray:
     import d3rlpy
     import torch
@@ -631,12 +651,14 @@ def _predict_cql_probs_all_actions(
     # Register custom Q-function factories (e.g., dueling) for load_learnable deserialization.
     from src.train import dueling_q  # noqa: F401
 
+    d3rlpy_device, torch_device = _resolve_runtime_device(device)
+
     algo = None
     try:
-        algo = d3rlpy.load_learnable(str(cql_model), device=DEVICE)
+        algo = d3rlpy.load_learnable(str(cql_model), device=d3rlpy_device)
     except Exception:
         # Backward compatibility with legacy artifacts saved via save_model.
-        algo = d3rlpy.algos.DiscreteCQLConfig(alpha=1.0).create(device=DEVICE)
+        algo = d3rlpy.algos.DiscreteCQLConfig(alpha=1.0).create(device=d3rlpy_device)
         algo.build_with_dataset(dataset)
         algo.load_model(str(cql_model))
 
@@ -648,7 +670,7 @@ def _predict_cql_probs_all_actions(
     out = []
     for start in range(0, observations.shape[0], max(1, batch_size)):
         end = min(observations.shape[0], start + max(1, batch_size))
-        x = torch.tensor(observations[start:end], dtype=torch.float32)
+        x = torch.as_tensor(observations[start:end], dtype=torch.float32, device=torch_device)
         with torch.no_grad():
             q = q_forwarder.compute_expected_q(x)
             probs = torch.softmax(q / temp, dim=1).detach().cpu().numpy()
@@ -862,6 +884,7 @@ def _build_alpha_sensitivity(
                 cql_model=mpath,
                 temperature=args.cql_temperature,
                 batch_size=args.prob_batch_size,
+                device=args.device,
             )
         except Exception as exc:
             print(f"Warning: skipping alpha={alpha:g} sensitivity point due to model eval error: {exc}")
@@ -1044,6 +1067,7 @@ def main() -> None:
                 dataset=dataset,
                 bc_model=args.bc_model,
                 batch_size=args.prob_batch_size,
+                device=args.device,
             )
             cql_probs = _predict_cql_probs_all_actions(
                 observations=observations,
@@ -1051,6 +1075,7 @@ def main() -> None:
                 cql_model=args.cql_model,
                 temperature=args.cql_temperature,
                 batch_size=args.prob_batch_size,
+                device=args.device,
             )
 
             bc_action_dist = np.mean(bc_probs, axis=0)
@@ -1265,6 +1290,7 @@ def main() -> None:
         "n_episodes_eval": wis.get("n_episodes_eval"),
         "reward_unique_values": reward_unique_values,
         "reward_is_terminal_binary": reward_is_terminal_binary,
+        "device": args.device,
         "survival_label_is_rigorous": reward_is_terminal_binary,
         "action_mapping": {
             "formula": "action = fluid_bin * 5 + vaso_bin",
