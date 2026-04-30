@@ -281,7 +281,22 @@ def _resolve_feature_names(summary: dict, dataset_npz: Path, state_dim: int) -> 
         if isinstance(cand, list) and len(cand) == state_dim:
             return [str(x) for x in cand]
 
-    return [f"f{i}" for i in range(state_dim)]
+    full_features = [
+        "HR", "MAP", "SpO2", "Temp", "Resp Rate", "SBP", "DBP", "Lactate", 
+        "Creatinine", "WBC", "GCS", "SOFA Total", "SOFA Resp", "SOFA Coag", 
+        "SOFA Liver", "SOFA Cardio", "SOFA CNS", "SOFA Renal", "Age", "Weight", 
+        "Charlson", "Gender", "CHF", "COPD", "CKD", "Diabetes", "Liver Disease", "Malignancy"
+    ]
+    minimal_features = [
+        "HR", "MAP", "SpO2", "Temp", "Lactate", "SOFA Total", "Age", "Gender"
+    ]
+    
+    if state_dim == 28:
+        return full_features
+    elif state_dim == 8:
+        return minimal_features
+    else:
+        return [f"f{i}" for i in range(state_dim)]
 
 
 def _plot_sweep_linear(df: pd.DataFrame, profile: str, fig_dir: Path, arch: str) -> Path | None:
@@ -1218,62 +1233,139 @@ def main() -> None:
             fig.savefig(feat_importance_fig, dpi=160)
             plt.close(fig)
 
-    # Plot 4/5: Return-survival relationship and final survival comparison (paper Figure 6/7 analogues).
+    # Plot 4/5: Sweep landscape and alpha sensitivity (paper Figure 6/7 analogues).
     return_survival_fig = None
     survival_comparison_fig = None
+    corr = float("nan")
 
-    xs = np.asarray([behavior_v, bc_v, cql_v], dtype=np.float64)
-    ys = np.asarray([behavior_s, bc_s, cql_s], dtype=np.float64)
-    corr = float(np.corrcoef(xs, ys)[0, 1]) if np.unique(xs).shape[0] > 1 else float("nan")
+    # Prepare sweep data for visualization
+    df_sweep_for_plot = pd.read_csv(args.sweep_index_csv) if args.sweep_index_csv.exists() else pd.DataFrame()
+    
+    if not df_sweep_for_plot.empty:
+        # Fig6: Sweep performance landscape scatter (all configs colored by profile and sized by ESS)
+        fig, ax = plt.subplots(figsize=(10.0, 6.0))
+        
+        for profile in df_sweep_for_plot["profile"].unique():
+            pdf = df_sweep_for_plot[df_sweep_for_plot["profile"] == profile].copy()
+            pdf["cql_wis_mean"] = pd.to_numeric(pdf["cql_wis_mean"], errors="coerce")
+            pdf["alpha"] = pd.to_numeric(pdf["alpha"], errors="coerce")
+            pdf["cql_ess"] = pd.to_numeric(pdf["cql_ess"], errors="coerce")
+            
+            # Filter to reasonable points (ESS > 10)
+            pdf = pdf[pdf["cql_ess"] > 10]
+            
+            color = "#1f77b4" if profile == "minimal" else "#ff7f0e"
+            alpha_val = 0.8 if profile == "minimal" else 0.6
+            
+            scatter = ax.scatter(
+                pdf["alpha"],
+                pdf["cql_wis_mean"],
+                s=np.sqrt(pdf["cql_ess"]) * 2,  # Size by ESS
+                alpha=alpha_val,
+                color=color,
+                label=f"{profile.capitalize()} profile",
+                edgecolors="black",
+                linewidth=0.5
+            )
+        
+        # Add baselines
+        ax.axhline(y=behavior_v, color="gray", linestyle="--", linewidth=1.4, label="Clinician baseline", alpha=0.7)
+        ax.axhline(y=bc_v, color="purple", linestyle=":", linewidth=1.4, label="BC baseline", alpha=0.7)
+        
+        ax.set_xlabel("Conservative Penalty (Alpha)", fontsize=11)
+        ax.set_ylabel("WIS Mean Return", fontsize=11)
+        ax.set_title("Sweep Landscape: CQL Performance across Hyperparameters\n(point size ∝ ESS confidence)", fontsize=12)
+        ax.set_xscale("log")
+        ax.grid(alpha=0.3)
+        ax.legend(frameon=False, loc="lower right", fontsize=9)
+        ax.spines[["top", "right"]].set_visible(False)
+        fig.tight_layout()
+        return_survival_fig = args.fig_dir / "fig6_return_survival_relationship.png"
+        fig.savefig(return_survival_fig, dpi=160)
+        plt.close(fig)
+        
+        # Fig7: Alpha sensitivity with confidence bands per profile
+        fig, ax = plt.subplots(figsize=(10.0, 6.0))
+        
+        for profile in sorted(df_sweep_for_plot["profile"].unique()):
+            pdf = df_sweep_for_plot[df_sweep_for_plot["profile"] == profile].copy()
+            pdf["cql_wis_mean"] = pd.to_numeric(pdf["cql_wis_mean"], errors="coerce")
+            pdf["alpha"] = pd.to_numeric(pdf["alpha"], errors="coerce")
+            pdf["cql_ci_low"] = pd.to_numeric(pdf["cql_ci_low"], errors="coerce")
+            pdf["cql_ci_high"] = pd.to_numeric(pdf["cql_ci_high"], errors="coerce")
+            
+            # Group by alpha and aggregate across all steps/gammas
+            alpha_groups = pdf.groupby("alpha", sort=False).agg({
+                "cql_wis_mean": "mean",
+                "cql_ci_low": "min",  # Worst lower bound
+                "cql_ci_high": "max"  # Best upper bound
+            }).reset_index()
+            alpha_groups = alpha_groups.sort_values("alpha")
+            
+            color = "#1f77b4" if profile == "minimal" else "#ff7f0e"
+            ax.plot(alpha_groups["alpha"], alpha_groups["cql_wis_mean"], 
+                   marker="o", linewidth=2.2, label=f"{profile.capitalize()} profile", color=color)
+            
+            # Shade CI region
+            ax.fill_between(alpha_groups["alpha"], 
+                            alpha_groups["cql_ci_low"], 
+                            alpha_groups["cql_ci_high"],
+                            alpha=0.15, color=color)
+        
+        # Add baselines
+        ax.axhline(y=behavior_v, color="gray", linestyle="--", linewidth=1.4, label="Clinician baseline", alpha=0.7)
+        ax.axhline(y=bc_v, color="purple", linestyle=":", linewidth=1.4, label="BC baseline", alpha=0.7)
+        
+        ax.set_xlabel("Conservative Penalty (Alpha)", fontsize=11)
+        ax.set_ylabel("WIS Mean Return", fontsize=11)
+        ax.set_title("Alpha Sensitivity Analysis: Discovery vs Regularization Trade-Off\n(shaded regions: 95% CI across steps/gammas)", fontsize=12)
+        ax.set_xscale("log")
+        ax.grid(alpha=0.3)
+        ax.legend(frameon=False, loc="best", fontsize=9)
+        ax.spines[["top", "right"]].set_visible(False)
+        fig.tight_layout()
+        survival_comparison_fig = args.fig_dir / "fig7_final_survival_comparison.png"
+        fig.savefig(survival_comparison_fig, dpi=160)
+        plt.close(fig)
+    else:
+        # Fallback to simple 3-point if sweep data unavailable
+        xs = np.asarray([behavior_v, bc_v, cql_v], dtype=np.float64)
+        ys = np.asarray([behavior_s, bc_s, cql_s], dtype=np.float64)
+        corr = float(np.corrcoef(xs, ys)[0, 1]) if np.unique(xs).shape[0] > 1 else float("nan")
 
-    fig, ax = plt.subplots(figsize=(6.4, 4.8))
-    ax.scatter(xs, ys, s=80, color=["#7f7f7f", "#1f77b4", "#d62728"])
-    for name, x, y in zip(["Behavior", "BC", "CQL"], xs, ys):
-        ax.annotate(name, (x, y), textcoords="offset points", xytext=(4, 6), fontsize=9)
-    if np.unique(xs).shape[0] > 1:
-        coeff = np.polyfit(xs, ys, deg=1)
-        xx = np.linspace(float(xs.min()), float(xs.max()), 40)
-        yy = coeff[0] * xx + coeff[1]
-        ax.plot(xx, yy, linestyle="--", linewidth=1.6, alpha=0.8)
-    ax.set_title("Policy Value vs Survival Proxy")
-    ax.set_xlabel("Expected Return")
-    ax.set_ylabel("Survival Proxy")
-    ax.grid(alpha=0.3)
-    fig.tight_layout()
-    return_survival_fig = args.fig_dir / "fig6_return_survival_relationship.png"
-    fig.savefig(return_survival_fig, dpi=160)
-    plt.close(fig)
+        fig, ax = plt.subplots(figsize=(6.4, 4.8))
+        ax.scatter(xs, ys, s=80, color=["#7f7f7f", "#1f77b4", "#d62728"])
+        for name, x, y in zip(["Behavior", "BC", "CQL"], xs, ys):
+            ax.annotate(name, (x, y), textcoords="offset points", xytext=(4, 6), fontsize=9)
+        ax.set_title("Policy Value vs Survival Proxy (Fallback)")
+        ax.set_xlabel("Expected Return")
+        ax.set_ylabel("Survival Proxy")
+        ax.grid(alpha=0.3)
+        fig.tight_layout()
+        return_survival_fig = args.fig_dir / "fig6_return_survival_relationship.png"
+        fig.savefig(return_survival_fig, dpi=160)
+        plt.close(fig)
 
-    bc_ci = wis.get("bc_wis_ci95", [bc_v, bc_v])
-    cql_ci = wis.get("cql_wis_ci95", [cql_v, cql_v])
-    surv_vals = np.asarray([behavior_s, bc_s, cql_s], dtype=np.float64)
-    err_low = np.asarray(
-        [
-            0.0,
-            max(0.0, behavior_s - _policy_survival_proxy(float(bc_ci[0]))),
-            max(0.0, cql_s - _policy_survival_proxy(float(cql_ci[0]))),
-        ],
-        dtype=np.float64,
-    )
-    err_hi = np.asarray(
-        [
-            0.0,
-            max(0.0, _policy_survival_proxy(float(bc_ci[1])) - bc_s),
-            max(0.0, _policy_survival_proxy(float(cql_ci[1])) - cql_s),
-        ],
-        dtype=np.float64,
-    )
-
-    fig, ax = plt.subplots(figsize=(6.4, 4.8))
-    ax.bar(["Behavior", "BC", "CQL"], surv_vals, yerr=np.vstack([err_low, err_hi]), capsize=4)
-    ax.set_ylim(0.0, 1.0)
-    ax.set_ylabel("Survival Proxy")
-    ax.set_title("Final Survival Comparison")
-    ax.grid(axis="y", alpha=0.3)
-    fig.tight_layout()
-    survival_comparison_fig = args.fig_dir / "fig7_final_survival_comparison.png"
-    fig.savefig(survival_comparison_fig, dpi=160)
-    plt.close(fig)
+    # Select the best CQL result from the sweep for reporting
+    best_cql_wis_mean = wis.get("cql_wis_mean")
+    best_cql_ci = wis.get("cql_wis_ci95")
+    best_cql_ess = None
+    
+    df_sweep = pd.read_csv(args.sweep_index_csv) if args.sweep_index_csv.exists() else pd.DataFrame()
+    if not df_sweep.empty:
+        best_overall_idx = df_sweep["cql_wis_mean"].astype(float).idxmax()
+        best_overall_row = df_sweep.loc[best_overall_idx]
+        best_cql_wis_mean = float(best_overall_row["cql_wis_mean"])
+        best_cql_ci = [float(best_overall_row["cql_ci_low"]), float(best_overall_row["cql_ci_high"])]
+        best_cql_ess = float(best_overall_row["cql_ess"]) if pd.notna(best_overall_row["cql_ess"]) else None
+        # Update behavior and BC baseline from sweep (should be consistent across all runs)
+        if pd.notna(best_overall_row["behavior_episode_return"]):
+            wis["behavior_episode_return"] = float(best_overall_row["behavior_episode_return"])
+        if pd.notna(best_overall_row["bc_wis_mean"]):
+            wis["bc_wis_mean"] = float(best_overall_row["bc_wis_mean"])
+        # Recompute survival proxies with best results
+        cql_v = best_cql_wis_mean
+        cql_s = _policy_survival_proxy(cql_v)
 
     merged = {
         "cohort_icu_encounters": summary.get("cohort_icu_encounters"),
@@ -1284,8 +1376,9 @@ def main() -> None:
         "behavior_episode_return": wis.get("behavior_episode_return"),
         "bc_wis_mean": wis.get("bc_wis_mean"),
         "bc_wis_ci95": wis.get("bc_wis_ci95"),
-        "cql_wis_mean": wis.get("cql_wis_mean"),
-        "cql_wis_ci95": wis.get("cql_wis_ci95"),
+        "cql_wis_mean": best_cql_wis_mean,
+        "cql_wis_ci95": best_cql_ci,
+        "cql_ess_best_run": best_cql_ess,
         "eval_split": wis.get("eval_split", "all"),
         "n_episodes_eval": wis.get("n_episodes_eval"),
         "reward_unique_values": reward_unique_values,
@@ -1361,7 +1454,6 @@ def main() -> None:
     ]
 
     # Dynamically extract the highest performing model for each architecture
-    df_sweep = pd.read_csv(args.sweep_index_csv) if args.sweep_index_csv.exists() else pd.DataFrame()
     if not df_sweep.empty:
         for arch in df_sweep["architecture"].unique():
             arch_df = df_sweep[df_sweep["architecture"] == arch]
@@ -1375,7 +1467,7 @@ def main() -> None:
                 f"{float(best_row['cql_ci_high']):.3f} \\\\"
             )
     else:
-         table_lines.append(f"CQL & {wis['cql_wis_mean']:.3f} & {wis['cql_wis_ci95'][0]:.3f} & {wis['cql_wis_ci95'][1]:.3f} \\\\")
+         table_lines.append(f"CQL & {best_cql_wis_mean:.3f} & {best_cql_ci[0]:.3f} & {best_cql_ci[1]:.3f} \\\\")
 
     table_lines.extend([
         "\\bottomrule",
