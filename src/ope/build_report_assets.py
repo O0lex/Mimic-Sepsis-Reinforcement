@@ -188,8 +188,9 @@ def _set_reasonable_y_limits(ax, values: list[float]) -> None:
 
 
 def _parse_wis_filename(path: Path) -> dict | None:
+    # Changed [\d_]+ to [\d_]*\d to ensure it ends in a digit and doesn't grab trailing underscores
     m = re.search(
-        r"mimic_mdp_(?P<profile>full|minimal)_wis_s(?P<steps>\d+)_a(?P<alpha>[\d_]+)(?:_g(?P<gamma>[\d_]+))?(?:_arch_(?P<arch>[a-zA-Z0-9_\-]+))?\.json$",
+        r"mimic_mdp_(?P<profile>full|minimal)_wis_s(?P<steps>\d+)_a(?P<alpha>[\d_]*\d)(?:_g(?P<gamma>[\d_]*\d))?(?:_arch_(?P<arch>[a-zA-Z0-9_\-]+))?.*\.json$",
         path.name,
     )
     if not m:
@@ -197,16 +198,22 @@ def _parse_wis_filename(path: Path) -> dict | None:
 
     profile = str(m.group("profile"))
     steps = int(m.group("steps"))
+    
+    # Now this will safely convert "1_5" to 1.5 without the trailing dot
     alpha = float(str(m.group("alpha")).replace("_", "."))
+    
     gamma_group = m.group("gamma")
-    gamma = float(str(gamma_group).replace("_", ".")) if gamma_group else 0.99
+    gamma = float(str(gamma_group).replace("_", ".")) if gamma_group else None
+    
     arch_group = m.group("arch")
     architecture = _arch_token(str(arch_group)) if arch_group else None
+    
     return {
         "profile": profile,
         "steps": steps,
         "alpha": alpha,
         "gamma": gamma,
+        "gamma_in_filename": gamma_group is not None,
         "architecture": architecture,
     }
 
@@ -228,6 +235,13 @@ def _collect_sweep_index(search_dirs: list[Path]) -> pd.DataFrame:
 
             architecture = info.get("architecture") or _infer_architecture(path=path, payload=payload)
             architecture = _arch_token(architecture)
+            gamma = info.get("gamma")
+            if not bool(info.get("gamma_in_filename", False)):
+                path_gamma = _parse_gamma_from_path(path)
+                if path_gamma is not None:
+                    gamma = path_gamma
+            if gamma is None:
+                gamma = 0.99
 
             ci = payload.get("cql_wis_ci95") or [None, None]
             row = {
@@ -235,7 +249,7 @@ def _collect_sweep_index(search_dirs: list[Path]) -> pd.DataFrame:
                 "architecture": architecture,
                 "steps": int(info["steps"]),
                 "alpha": float(info["alpha"]),
-                "gamma": float(info["gamma"]),
+                "gamma": float(gamma),
                 "behavior_episode_return": payload.get("behavior_episode_return"),
                 "bc_wis_mean": payload.get("bc_wis_mean"),
                 "cql_wis_mean": payload.get("cql_wis_mean", payload.get("v_mean")),
@@ -385,21 +399,36 @@ def _plot_sweep_heatmap(df: pd.DataFrame, profile: str, fig_dir: Path, arch: str
     if pivot.empty:
         return None
 
-    fig, ax = plt.subplots(figsize=(9.2, 5.4))
-    im = ax.imshow(pivot.values, aspect="auto", cmap="viridis", origin="lower")
+    fig, ax = plt.subplots(figsize=(10.5, 6.0)) # Slightly wider to fit numbers
+    data = pivot.values
+    im = ax.imshow(data, aspect="auto", cmap="viridis", origin="lower")
+    
+    # Overlay numerical values
+    for i in range(data.shape[0]):
+        for j in range(data.shape[1]):
+            val = data[i, j]
+            if not np.isnan(val):
+                # Adaptive text color: white for dark cells, black for light cells
+                text_color = "white" if val < 0.55 else "black"
+                ax.text(j, i, f"{val:.3f}", ha="center", va="center", 
+                        color=text_color, fontsize=9, fontweight='bold')
+
     ax.set_title(f"WIS Heatmap ({profile.capitalize()}, {_arch_label(arch)})")
-    ax.set_xlabel("Alpha")
-    ax.set_ylabel("Steps")
+    ax.set_xlabel("Alpha (Conservative Penalty)")
+    ax.set_ylabel("Training Steps")
+    
     ax.set_xticks(np.arange(pivot.shape[1]))
     ax.set_xticklabels([f"{float(a):g}" for a in pivot.columns], rotation=35, ha="right")
+    
     ax.set_yticks(np.arange(pivot.shape[0]))
     ax.set_yticklabels([str(int(s)) for s in pivot.index])
+    
     cbar = plt.colorbar(im)
-    cbar.set_label("CQL WIS Mean")
+    cbar.set_label("CQL WIS Mean Return")
     fig.tight_layout()
 
     out_path = fig_dir / f"fig11_sweep_heatmap_{profile}_arch_{_arch_token(arch)}.png"
-    fig.savefig(out_path, dpi=170)
+    fig.savefig(out_path, dpi=200)
     plt.close(fig)
     return out_path
 
@@ -427,6 +456,160 @@ def _plot_algorithm_means(df: pd.DataFrame, profile: str, fig_dir: Path, arch: s
 
     out_path = fig_dir / f"fig12_mean_return_algorithms_{profile}_arch_{_arch_token(arch)}.png"
     fig.savefig(out_path, dpi=170)
+    plt.close(fig)
+    return out_path
+
+
+def _plot_horizon_sensitivity(
+    df: pd.DataFrame,
+    fig_dir: Path,
+    profile: str,
+    arch: str,
+    steps_keep: tuple[int, ...] = (5000, 50000),
+    alphas_keep: tuple[float, ...] = (0.25, 1.0),
+    gammas_keep: tuple[float, ...] = (0.9, 0.95, 0.99),
+) -> Path | None:
+    if df.empty:
+        return None
+
+    work = df.copy()
+    work["steps"] = pd.to_numeric(work["steps"], errors="coerce")
+    work["alpha"] = pd.to_numeric(work["alpha"], errors="coerce")
+    work["gamma"] = pd.to_numeric(work["gamma"], errors="coerce")
+    work["cql_wis_mean"] = pd.to_numeric(work["cql_wis_mean"], errors="coerce")
+    work = work.dropna(subset=["steps", "alpha", "gamma", "cql_wis_mean"])
+    if work.empty:
+        return None
+
+    sel = work[
+        work["steps"].isin(list(steps_keep))
+        & work["alpha"].isin(list(alphas_keep))
+        & work["gamma"].isin(list(gammas_keep))
+    ].copy()
+    if sel.empty:
+        return None
+
+    grouped = (
+        sel.groupby(["steps", "alpha", "gamma"], as_index=False)["cql_wis_mean"]
+        .mean()
+        .sort_values(["steps", "alpha", "gamma"])
+    )
+    if grouped.empty:
+        return None
+
+    combo_labels: list[str] = []
+    for s in steps_keep:
+        for a in alphas_keep:
+            if ((grouped["steps"] == s) & (grouped["alpha"] == a)).any():
+                combo_labels.append(f"{int(s/1000)}k, a={a:g}")
+    if not combo_labels:
+        return None
+
+    x = np.arange(len(combo_labels), dtype=np.float64)
+    width = 0.23
+    colors = {0.9: "#457b9d", 0.95: "#2a9d8f", 0.99: "#e76f51"}
+
+    fig, ax = plt.subplots(figsize=(9.0, 4.8))
+    y_vals: list[float] = []
+    for gi, gamma in enumerate(gammas_keep):
+        vals: list[float] = []
+        for label in combo_labels:
+            step_tok, alpha_tok = label.split(", a=")
+            s_val = int(step_tok.replace("k", "")) * 1000
+            a_val = float(alpha_tok)
+            hit = grouped[
+                (grouped["steps"] == s_val)
+                & (np.isclose(grouped["alpha"], a_val))
+                & (np.isclose(grouped["gamma"], gamma))
+            ]
+            vals.append(float(hit["cql_wis_mean"].iloc[0]) if not hit.empty else np.nan)
+        arr = np.asarray(vals, dtype=np.float64)
+        y_vals.extend(arr[np.isfinite(arr)].tolist())
+        ax.bar(x + (gi - 1) * width, arr, width=width, label=fr"$\gamma={gamma:g}$", color=colors.get(gamma, "#6c757d"), alpha=0.9)
+
+    if not y_vals:
+        plt.close(fig)
+        return None
+
+    _set_reasonable_y_limits(ax, y_vals)
+    ax.set_xticks(x)
+    ax.set_xticklabels(combo_labels)
+    ax.set_xlabel("Training Step and Conservative Penalty")
+    ax.set_ylabel("WIS Mean Return")
+    ax.set_title(f"Horizon Sensitivity ({profile.capitalize()}, {_arch_label(arch)})")
+    ax.grid(axis="y", alpha=0.3)
+    ax.legend(frameon=False)
+    fig.tight_layout()
+
+    out_path = fig_dir / "fig13_gamma_horizon_sensitivity.png"
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    return out_path
+
+
+def _plot_gamma_horizon_line_chart(
+    df: pd.DataFrame,
+    fig_dir: Path,
+    profile: str,
+    arch: str,
+    alphas_keep: tuple[float, ...] = (0.25, 1.0, 5.0),
+    gammas_keep: tuple[float, ...] = (0.9, 0.95, 0.99),
+) -> Path | None:
+    """
+    Generate a line chart showing CQL performance across gamma (clinical horizon) and alpha (conservatism)
+    for a specific profile and architecture. This helps visualize the importance of discount factor in
+    enabling long-term reward propagation for sepsis treatment.
+    """
+    if df.empty:
+        return None
+
+    plot_df = df.copy()
+    plot_df["alpha"] = pd.to_numeric(plot_df["alpha"], errors="coerce")
+    plot_df["gamma"] = pd.to_numeric(plot_df["gamma"], errors="coerce")
+    plot_df["steps"] = pd.to_numeric(plot_df["steps"], errors="coerce")
+    plot_df["cql_wis_mean"] = pd.to_numeric(plot_df["cql_wis_mean"], errors="coerce")
+
+    plot_df = plot_df[
+        plot_df["alpha"].isin(list(alphas_keep))
+        & plot_df["gamma"].isin(list(gammas_keep))
+    ].dropna(subset=["steps", "alpha", "gamma", "cql_wis_mean"])
+
+    if plot_df.empty:
+        return None
+
+    color_families = {
+        0.99: ["#800000", "#ff0000", "#ff7f7f"],      # Dark Red, Red, Salmon
+        0.95: ["#006400", "#00ff00", "#90ee90"],      # Dark Green, Green, Light Green
+        0.90: ["#000080", "#0000ff", "#add8e6"],      # Navy, Blue, Sky Blue
+    }
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    has_data = False
+
+    for gi, gamma in enumerate(gammas_keep):
+        gdf = plot_df[np.isclose(plot_df["gamma"], gamma)]
+        for ai, alpha in enumerate(alphas_keep):
+            adf = gdf[np.isclose(gdf["alpha"], alpha)].sort_values("steps")
+            if not adf.empty:
+                has_data = True
+                label = fr"$\gamma={gamma:g}$, $\alpha={alpha:g}$"
+                color = color_families.get(gamma, ["#6c757d"] * 3)[ai]
+                ax.plot(adf["steps"], adf["cql_wis_mean"], marker="o", color=color, label=label, linewidth=2)
+
+    if not has_data:
+        plt.close(fig)
+        return None
+
+    ax.set_xscale("log")
+    ax.set_xlabel("Training Steps (Log Scale)")
+    ax.set_ylabel("WIS Mean Return")
+    ax.set_title(f"Clinical Horizon Analysis: Performance across Gamma and Alpha ({profile.capitalize()}, {_arch_label(arch)})")
+    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize="small", frameon=False)
+    ax.grid(True, which="both", ls="-", alpha=0.2)
+    fig.tight_layout()
+
+    out_path = fig_dir / "fig13_horizon_line_chart.png"
+    fig.savefig(out_path, dpi=200)
     plt.close(fig)
     return out_path
 
@@ -474,6 +657,18 @@ def _build_sweep_artifacts(args: argparse.Namespace) -> dict:
             line_fig = _plot_sweep_linear(plot_df, profile=profile, fig_dir=args.fig_dir, arch=arch)
             heat_fig = _plot_sweep_heatmap(plot_df, profile=profile, fig_dir=args.fig_dir, arch=arch)
             mean_fig = _plot_algorithm_means(plot_df, profile=profile, fig_dir=args.fig_dir, arch=arch)
+            
+            # Generate horizon sensitivity line chart for full profile + MLP
+            horizon_line_fig = None
+            if profile == "full" and arch_tok == "mlp":
+                horizon_line_fig = _plot_gamma_horizon_line_chart(
+                    pdf,  # Use full profile data, not gamma_mode filtered
+                    fig_dir=args.fig_dir,
+                    profile=profile,
+                    arch=arch,
+                    alphas_keep=(0.25, 1.0, 5.0),
+                    gammas_keep=(0.9, 0.95, 0.99),
+                )
 
             if log_fig is not None:
                 figures[f"sweep_trend_{profile}_{arch_tok}"] = str(log_fig)
@@ -483,6 +678,8 @@ def _build_sweep_artifacts(args: argparse.Namespace) -> dict:
                 figures[f"fig11_sweep_heatmap_{profile}_{arch_tok}"] = str(heat_fig)
             if mean_fig is not None:
                 figures[f"fig12_mean_return_algorithms_{profile}_{arch_tok}"] = str(mean_fig)
+            if horizon_line_fig is not None:
+                figures["fig13_horizon_line_chart"] = str(horizon_line_fig)
 
             profile_arch_key = f"{profile}_{arch_tok}"
             profiles[profile_arch_key] = {
@@ -518,6 +715,34 @@ def _build_sweep_artifacts(args: argparse.Namespace) -> dict:
                 dst = f"{base_name}_{profile}"
                 if src in figures and dst not in figures:
                     figures[dst] = figures[src]
+
+    horizon_subset = df.copy()
+    if "minimal" in horizon_subset["profile"].unique().tolist():
+        horizon_subset = horizon_subset[horizon_subset["profile"] == "minimal"]
+    horizon_arch = "unspecified"
+    if not horizon_subset.empty:
+        arches = horizon_subset["architecture"].unique().tolist()
+        if "dueling" in arches:
+            horizon_subset = horizon_subset[horizon_subset["architecture"] == "dueling"]
+            horizon_arch = "dueling"
+        elif "mlp" in arches:
+            horizon_subset = horizon_subset[horizon_subset["architecture"] == "mlp"]
+            horizon_arch = "mlp"
+        elif arches:
+            horizon_arch = str(arches[0])
+            horizon_subset = horizon_subset[horizon_subset["architecture"] == horizon_arch]
+
+    horizon_fig = _plot_horizon_sensitivity(
+        horizon_subset,
+        fig_dir=args.fig_dir,
+        profile="minimal" if not horizon_subset.empty else "all",
+        arch=horizon_arch,
+        steps_keep=(5000, 50000),
+        alphas_keep=(0.25, 1.0),
+        gammas_keep=(0.9, 0.95, 0.99),
+    )
+    if horizon_fig is not None:
+        figures["fig13_gamma_horizon_sensitivity"] = str(horizon_fig)
 
     return {
         "index_csv": str(args.sweep_index_csv),
@@ -1047,8 +1272,43 @@ def main() -> None:
             axes[1].grid(alpha=0.3)
             axes[1].legend(frameon=False, fontsize=8)
         else:
-            axes[1].set_title("CQL Training Objective (Unavailable)")
-            axes[1].axis("off")
+            # Try a fallback: some training summaries store loss arrays in the train_metrics.json
+            fallback_plotted = False
+            for steps, gamma, alpha, metrics, mpath in cql_run_metrics:
+                lbl = f"a={alpha:g}, g={gamma:g}, s={steps}" if steps > 0 else f"a={alpha:g}, g={gamma:g}"
+                # Common keys that may contain loss arrays
+                candidate_keys = [
+                    "td_loss",
+                    "td_losses",
+                    "td_loss_values",
+                    "td_loss_curve",
+                    "loss",
+                    "losses",
+                    "loss_curve",
+                    "train_loss",
+                    "train_losses",
+                ]
+                for key in candidate_keys:
+                    vals = metrics.get(key) if isinstance(metrics, dict) else None
+                    if isinstance(vals, (list, tuple)) and len(vals) > 2:
+                        try:
+                            arr = np.asarray(vals, dtype=float)
+                            xs = np.arange(arr.shape[0])
+                            axes[1].plot(xs, arr, linewidth=1.8, label=lbl)
+                            fallback_plotted = True
+                            break
+                        except Exception:
+                            continue
+            if fallback_plotted:
+                axes[1].set_title("CQL Training Objective (from train_metrics.json)")
+                axes[1].set_xlabel("Index")
+                axes[1].set_ylabel("Loss")
+                axes[1].grid(alpha=0.3)
+                axes[1].legend(frameon=False, fontsize=8)
+                plotted_cql = True
+            else:
+                axes[1].set_title("CQL Training Objective (Unavailable)")
+                axes[1].axis("off")
 
         fig.tight_layout()
         training_curves_fig = args.fig_dir / "fig2_training_objective_curves.png"
@@ -1293,28 +1553,46 @@ def main() -> None:
             pdf["alpha"] = pd.to_numeric(pdf["alpha"], errors="coerce")
             pdf["cql_ci_low"] = pd.to_numeric(pdf["cql_ci_low"], errors="coerce")
             pdf["cql_ci_high"] = pd.to_numeric(pdf["cql_ci_high"], errors="coerce")
-            
-            # Group by alpha and aggregate across all steps/gammas
+
+            # Select the single step value that performs best on average (across alphas/gammas)
+            best_step = None
+            try:
+                step_means = (
+                    pdf.groupby("steps")["cql_wis_mean"].mean().dropna()
+                )
+                if not step_means.empty:
+                    best_step = int(step_means.idxmax())
+            except Exception:
+                best_step = None
+
+            if best_step is not None:
+                # Filter to the best-performing step (aggregate across gammas if present)
+                pdf = pdf[pdf["steps"] == best_step].copy()
+
+            # Group by alpha and aggregate across remaining gammas (if any)
             alpha_groups = pdf.groupby("alpha", sort=False).agg({
                 "cql_wis_mean": "mean",
                 "cql_ci_low": "min",  # Worst lower bound
                 "cql_ci_high": "max"  # Best upper bound
             }).reset_index()
             alpha_groups = alpha_groups.sort_values("alpha")
-            
+
             color = "#1f77b4" if profile == "minimal" else "#ff7f0e"
+            label = f"{profile.capitalize()} profile"
+            if best_step is not None:
+                label = f"{label} (best s={best_step})"
+
             ax.plot(alpha_groups["alpha"], alpha_groups["cql_wis_mean"], 
-                   marker="o", linewidth=2.2, label=f"{profile.capitalize()} profile", color=color)
-            
+                   marker="o", linewidth=2.2, label=label, color=color)
+
             # Shade CI region
             ax.fill_between(alpha_groups["alpha"], 
-                            alpha_groups["cql_ci_low"], 
-                            alpha_groups["cql_ci_high"],
+                            alpha_groups["cql_ci_low"].fillna(alpha_groups["cql_wis_mean"] - 0.01), 
+                            alpha_groups["cql_ci_high"].fillna(alpha_groups["cql_wis_mean"] + 0.01),
                             alpha=0.15, color=color)
         
-        # Add baselines
+        # Add clinician baseline only (BC baseline removed per user request)
         ax.axhline(y=behavior_v, color="gray", linestyle="--", linewidth=1.4, label="Clinician baseline", alpha=0.7)
-        ax.axhline(y=bc_v, color="purple", linestyle=":", linewidth=1.4, label="BC baseline", alpha=0.7)
         
         ax.set_xlabel("Conservative Penalty (Alpha)", fontsize=11)
         ax.set_ylabel("WIS Mean Return", fontsize=11)

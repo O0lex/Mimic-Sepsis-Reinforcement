@@ -36,6 +36,10 @@ case "$ARCH_MODE" in
 esac
 
 # Pass all arguments from sbatch to the python script
+
+# Diagnostic check for GPU visibility
+python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'Active device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"None\"}')"
+
 python -m experiments.run_all \
     --cql-architectures "$CQL_ARCHS" \
     --report-arch "${REPORT_ARCH_OVERRIDE:-$DEFAULT_REPORT_ARCH}" \
