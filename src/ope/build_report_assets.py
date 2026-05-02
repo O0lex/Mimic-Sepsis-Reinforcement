@@ -188,7 +188,6 @@ def _set_reasonable_y_limits(ax, values: list[float]) -> None:
 
 
 def _parse_wis_filename(path: Path) -> dict | None:
-    # Changed [\d_]+ to [\d_]*\d to ensure it ends in a digit and doesn't grab trailing underscores
     m = re.search(
         r"mimic_mdp_(?P<profile>full|minimal)_wis_s(?P<steps>\d+)_a(?P<alpha>[\d_]*\d)(?:_g(?P<gamma>[\d_]*\d))?(?:_arch_(?P<arch>[a-zA-Z0-9_\-]+))?.*\.json$",
         path.name,
@@ -198,13 +197,11 @@ def _parse_wis_filename(path: Path) -> dict | None:
 
     profile = str(m.group("profile"))
     steps = int(m.group("steps"))
-    
-    # Now this will safely convert "1_5" to 1.5 without the trailing dot
     alpha = float(str(m.group("alpha")).replace("_", "."))
-    
+
     gamma_group = m.group("gamma")
     gamma = float(str(gamma_group).replace("_", ".")) if gamma_group else None
-    
+
     arch_group = m.group("arch")
     architecture = _arch_token(str(arch_group)) if arch_group else None
     
@@ -399,19 +396,16 @@ def _plot_sweep_heatmap(df: pd.DataFrame, profile: str, fig_dir: Path, arch: str
     if pivot.empty:
         return None
 
-    fig, ax = plt.subplots(figsize=(10.5, 6.0)) # Slightly wider to fit numbers
+    fig, ax = plt.subplots(figsize=(10.5, 6.0))
     data = pivot.values
     im = ax.imshow(data, aspect="auto", cmap="viridis", origin="lower")
-    
-    # Overlay numerical values
+
     for i in range(data.shape[0]):
         for j in range(data.shape[1]):
             val = data[i, j]
             if not np.isnan(val):
-                # Adaptive text color: white for dark cells, black for light cells
                 text_color = "white" if val < 0.55 else "black"
-                ax.text(j, i, f"{val:.3f}", ha="center", va="center", 
-                        color=text_color, fontsize=9, fontweight='bold')
+                ax.text(j, i, f"{val:.3f}", ha="center", va="center", color=text_color, fontsize=9, fontweight="bold")
 
     ax.set_title(f"WIS Heatmap ({profile.capitalize()}, {_arch_label(arch)})")
     ax.set_xlabel("Alpha (Conservative Penalty)")
@@ -555,11 +549,6 @@ def _plot_gamma_horizon_line_chart(
     alphas_keep: tuple[float, ...] = (0.25, 1.0, 5.0),
     gammas_keep: tuple[float, ...] = (0.9, 0.95, 0.99),
 ) -> Path | None:
-    """
-    Generate a line chart showing CQL performance across gamma (clinical horizon) and alpha (conservatism)
-    for a specific profile and architecture. This helps visualize the importance of discount factor in
-    enabling long-term reward propagation for sepsis treatment.
-    """
     if df.empty:
         return None
 
@@ -578,9 +567,9 @@ def _plot_gamma_horizon_line_chart(
         return None
 
     color_families = {
-        0.99: ["#800000", "#ff0000", "#ff7f7f"],      # Dark Red, Red, Salmon
-        0.95: ["#006400", "#00ff00", "#90ee90"],      # Dark Green, Green, Light Green
-        0.90: ["#000080", "#0000ff", "#add8e6"],      # Navy, Blue, Sky Blue
+        0.99: ["#800000", "#ff0000", "#ff7f7f"],
+        0.95: ["#006400", "#00ff00", "#90ee90"],
+        0.90: ["#000080", "#0000ff", "#add8e6"],
     }
 
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -652,17 +641,15 @@ def _build_sweep_artifacts(args: argparse.Namespace) -> dict:
             existing = {(int(r.steps), float(r.alpha)) for r in plot_df[["steps", "alpha"]].itertuples(index=False)}
             missing = [{"steps": int(s), "alpha": float(a)} for s in steps_target for a in check_alphas if (int(s), float(a)) not in existing]
 
-            # Pass the arch parameter correctly to prevent crashes
             log_fig = _plot_sweep_log(plot_df, profile=profile, fig_dir=args.fig_dir, arch=arch)
             line_fig = _plot_sweep_linear(plot_df, profile=profile, fig_dir=args.fig_dir, arch=arch)
             heat_fig = _plot_sweep_heatmap(plot_df, profile=profile, fig_dir=args.fig_dir, arch=arch)
             mean_fig = _plot_algorithm_means(plot_df, profile=profile, fig_dir=args.fig_dir, arch=arch)
-            
-            # Generate horizon sensitivity line chart for full profile + MLP
+
             horizon_line_fig = None
             if profile == "full" and arch_tok == "mlp":
                 horizon_line_fig = _plot_gamma_horizon_line_chart(
-                    pdf,  # Use full profile data, not gamma_mode filtered
+                    pdf,
                     fig_dir=args.fig_dir,
                     profile=profile,
                     arch=arch,
@@ -943,11 +930,9 @@ def _wis_from_logged_probs(df: pd.DataFrame, policy_prob_col: str, clip: float) 
         mu = ep["mu_prob"].to_numpy(dtype=np.float64)
         rew = ep["reward"].to_numpy(dtype=np.float64)
 
-        # Log-space product for numerical stability
         log_ratios = np.log(np.clip(pi, 1e-12, 1.0)) - np.log(np.clip(mu, 1e-8, 1.0))
         cum_weight = np.exp(np.sum(log_ratios))
-        
-        # Cumulative clipping as per latest correctness standards
+
         if clip is not None:
             cum_weight = np.clip(cum_weight, 0.0, float(clip))
 
@@ -966,7 +951,6 @@ def _plot_clinical_heatmaps(
     cql_dist: np.ndarray,
     fig_dir: Path,
 ) -> dict[str, str]:
-    # For this project the action mapping is fixed to 5x5 fluid/vasopressor bins.
     if clinician_dist.shape[0] != 25 or bc_dist.shape[0] != 25 or cql_dist.shape[0] != 25:
         return {}
 
@@ -1272,11 +1256,9 @@ def main() -> None:
             axes[1].grid(alpha=0.3)
             axes[1].legend(frameon=False, fontsize=8)
         else:
-            # Try a fallback: some training summaries store loss arrays in the train_metrics.json
             fallback_plotted = False
             for steps, gamma, alpha, metrics, mpath in cql_run_metrics:
                 lbl = f"a={alpha:g}, g={gamma:g}, s={steps}" if steps > 0 else f"a={alpha:g}, g={gamma:g}"
-                # Common keys that may contain loss arrays
                 candidate_keys = [
                     "td_loss",
                     "td_losses",
@@ -1511,7 +1493,6 @@ def main() -> None:
             pdf["alpha"] = pd.to_numeric(pdf["alpha"], errors="coerce")
             pdf["cql_ess"] = pd.to_numeric(pdf["cql_ess"], errors="coerce")
             
-            # Filter to reasonable points (ESS > 10)
             pdf = pdf[pdf["cql_ess"] > 10]
             
             color = "#1f77b4" if profile == "minimal" else "#ff7f0e"
@@ -1520,7 +1501,7 @@ def main() -> None:
             scatter = ax.scatter(
                 pdf["alpha"],
                 pdf["cql_wis_mean"],
-                s=np.sqrt(pdf["cql_ess"]) * 2,  # Size by ESS
+                s=np.sqrt(pdf["cql_ess"]) * 2,
                 alpha=alpha_val,
                 color=color,
                 label=f"{profile.capitalize()} profile",
@@ -1554,7 +1535,6 @@ def main() -> None:
             pdf["cql_ci_low"] = pd.to_numeric(pdf["cql_ci_low"], errors="coerce")
             pdf["cql_ci_high"] = pd.to_numeric(pdf["cql_ci_high"], errors="coerce")
 
-            # Select the single step value that performs best on average (across alphas/gammas)
             best_step = None
             try:
                 step_means = (
@@ -1566,14 +1546,12 @@ def main() -> None:
                 best_step = None
 
             if best_step is not None:
-                # Filter to the best-performing step (aggregate across gammas if present)
                 pdf = pdf[pdf["steps"] == best_step].copy()
 
-            # Group by alpha and aggregate across remaining gammas (if any)
             alpha_groups = pdf.groupby("alpha", sort=False).agg({
                 "cql_wis_mean": "mean",
-                "cql_ci_low": "min",  # Worst lower bound
-                "cql_ci_high": "max"  # Best upper bound
+                "cql_ci_low": "min",
+                "cql_ci_high": "max"
             }).reset_index()
             alpha_groups = alpha_groups.sort_values("alpha")
 
@@ -1585,13 +1563,11 @@ def main() -> None:
             ax.plot(alpha_groups["alpha"], alpha_groups["cql_wis_mean"], 
                    marker="o", linewidth=2.2, label=label, color=color)
 
-            # Shade CI region
             ax.fill_between(alpha_groups["alpha"], 
                             alpha_groups["cql_ci_low"].fillna(alpha_groups["cql_wis_mean"] - 0.01), 
                             alpha_groups["cql_ci_high"].fillna(alpha_groups["cql_wis_mean"] + 0.01),
                             alpha=0.15, color=color)
         
-        # Add clinician baseline only (BC baseline removed per user request)
         ax.axhline(y=behavior_v, color="gray", linestyle="--", linewidth=1.4, label="Clinician baseline", alpha=0.7)
         
         ax.set_xlabel("Conservative Penalty (Alpha)", fontsize=11)
@@ -1606,7 +1582,6 @@ def main() -> None:
         fig.savefig(survival_comparison_fig, dpi=160)
         plt.close(fig)
     else:
-        # Fallback to simple 3-point if sweep data unavailable
         xs = np.asarray([behavior_v, bc_v, cql_v], dtype=np.float64)
         ys = np.asarray([behavior_s, bc_s, cql_s], dtype=np.float64)
         corr = float(np.corrcoef(xs, ys)[0, 1]) if np.unique(xs).shape[0] > 1 else float("nan")
@@ -1636,12 +1611,10 @@ def main() -> None:
         best_cql_wis_mean = float(best_overall_row["cql_wis_mean"])
         best_cql_ci = [float(best_overall_row["cql_ci_low"]), float(best_overall_row["cql_ci_high"])]
         best_cql_ess = float(best_overall_row["cql_ess"]) if pd.notna(best_overall_row["cql_ess"]) else None
-        # Update behavior and BC baseline from sweep (should be consistent across all runs)
         if pd.notna(best_overall_row["behavior_episode_return"]):
             wis["behavior_episode_return"] = float(best_overall_row["behavior_episode_return"])
         if pd.notna(best_overall_row["bc_wis_mean"]):
             wis["bc_wis_mean"] = float(best_overall_row["bc_wis_mean"])
-        # Recompute survival proxies with best results
         cql_v = best_cql_wis_mean
         cql_s = _policy_survival_proxy(cql_v)
 

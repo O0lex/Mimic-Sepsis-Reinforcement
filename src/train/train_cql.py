@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 import numpy as np
-import os
 
 from src.common.io import write_json
 from src.common.seed import set_seed
-
-
-
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Discrete CQL with d3rlpy.")
@@ -190,7 +187,6 @@ def main() -> None:
     run_dir = args.out_dir / f"alpha_{args.alpha:g}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # Deterministic naming avoids race conditions across fast alpha/step sweeps.
     experiment_name = (
         f"CQL_{args.model_arch}_alpha_{args.alpha:g}_gamma_{args.gamma:g}_steps_{args.n_steps}_seed_{args.seed}"
     )
@@ -222,9 +218,7 @@ def main() -> None:
         )
 
     model_path = run_dir / "cql_model.d3"
-    # Save architecture + weights for robust reload across custom Q-function factories.
     algo.save(str(model_path))
-    # Also keep a raw state_dict for debugging/legacy inspection.
     algo.save_model(str(run_dir / "cql_model_state.pt"))
 
     metrics = {

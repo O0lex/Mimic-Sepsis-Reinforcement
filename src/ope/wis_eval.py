@@ -101,7 +101,6 @@ def _predict_logged_probs_bc(
         sel = np.clip(action_idx[start:end], 0, max_action)
         logged_probs[start:end] = probs[np.arange(probs.shape[0]), sel]
 
-    # CHANGED: Increased floor from 1e-8 to 1e-4 to reduce variance
     return np.clip(logged_probs, 1e-4, 1.0)
 
 
@@ -120,7 +119,6 @@ def _predict_logged_probs_cql(
     except ImportError as exc:
         raise RuntimeError("d3rlpy and torch are required for CQL probability estimation.") from exc
 
-    # Register custom Q-function factories (e.g., dueling) for load_learnable deserialization.
     from src.train import dueling_q  # noqa: F401
 
     requested_device = str(device or DEVICE)
@@ -133,7 +131,6 @@ def _predict_logged_probs_cql(
     try:
         algo = d3rlpy.load_learnable(str(cql_model_path), device=requested_device)
     except Exception:
-        # Backward compatibility with legacy artifacts saved via save_model.
         algo = d3rlpy.algos.DiscreteCQLConfig(alpha=1.0).create(device=requested_device)
         algo.build_with_dataset(dataset)
         algo.load_model(str(cql_model_path))
@@ -172,15 +169,11 @@ def build_episode_arrays(df: pd.DataFrame, policy_col: str, clip: float | None =
         mu = ep["mu_prob"].to_numpy(dtype=np.float64)
         rewards = ep["reward"].to_numpy(dtype=np.float64)
 
-        # Calculate importance ratios
-        # Using a floor of 1e-8 for mu here is fine because of cumulative clipping
         ratios = pi / np.clip(mu, 1e-8, None)
-        
-        # Cumulative product of ratios for the whole episode
+
         log_ratios = np.log(pi) - np.log(np.clip(mu, 1e-8, None))
         cum_weight = np.exp(np.sum(log_ratios))
-        
-        # CHANGED: Clip the total episode weight instead of individual steps
+
         if clip is not None:
             cum_weight = np.clip(cum_weight, 0.0, clip)
 
@@ -195,10 +188,8 @@ def wis_from_episode_arrays(weights: np.ndarray, returns: np.ndarray) -> tuple[f
     if denom <= 0.0:
         return 0.0, 0.0
     
-    # Calculate WIS Mean
     estimate = float(np.sum(weights * returns) / denom)
-    
-    # Calculate ESS: (sum(w)^2) / sum(w^2)
+
     ess = float((denom**2) / np.sum(weights**2))
     
     return estimate, ess
@@ -210,14 +201,12 @@ def bootstrap_ci(df: pd.DataFrame, policy_col: str, n_boot: int, seed: int, clip
     n_episodes = episode_weights.shape[0]
     estimates = np.empty(n_boot, dtype=np.float64)
     
-    # Calculate global ESS for the whole test set
     _, global_ess = wis_from_episode_arrays(episode_weights, episode_returns)
 
     for i in range(n_boot):
         sampled_idx = np.random.randint(0, n_episodes, size=n_episodes)
         w = episode_weights[sampled_idx]
         g = episode_returns[sampled_idx]
-        # Only take the first element (the WIS estimate) for the CI distribution
         val, _ = wis_from_episode_arrays(w, g)
         estimates[i] = val
 
@@ -314,15 +303,14 @@ def main() -> None:
     bc_mean, bc_lo, bc_hi, bc_ess = bootstrap_ci(df, policy_col="bc_prob", n_boot=args.n_boot, seed=args.seed, clip=args.clip)
     cql_mean, cql_lo, cql_hi, cql_ess = bootstrap_ci(df, policy_col="cql_prob", n_boot=args.n_boot, seed=args.seed + 1, clip=args.clip)
 
-    # 2. Build the final summary (Include ESS here so it's saved!)
     summary = {
         "behavior_episode_return": behavior_return,
         "bc_wis_mean": bc_mean,
         "bc_wis_ci95": [bc_lo, bc_hi],
-        "bc_ess": bc_ess,  # Added for correctness
+        "bc_ess": bc_ess,
         "cql_wis_mean": cql_mean,
         "cql_wis_ci95": [cql_lo, cql_hi],
-        "cql_ess": cql_ess,  # Added for correctness
+        "cql_ess": cql_ess,
         "clip": args.clip,
         "n_boot": args.n_boot,
         "eval_split": split_used,
