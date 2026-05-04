@@ -6,10 +6,9 @@ This repository contains a scripts-first offline reinforcement learning pipeline
 - BC and CQL training, including the dueling Q-function variant used in sweeps
 - weighted importance sampling, sweep aggregation, and report figure generation
 
-Current state
+Current state:
 -------------
-- The main workflow lives in `src/` and is orchestrated by `experiments/run_all.py`.
-- Report-ready tables and figures are written to `report/generated/`.
+- The main workflow is in `src/` and is run by `experiments/run_all.py`.
 
 How to run
 ----------
@@ -30,8 +29,4 @@ Where outputs go
 - `d3rlpy_logs/` for per-run training logs
 - `report/generated/figures/` for the PNGs referenced by the LaTeX report
 
-Repository notes
-----------------
-- Avoid committing generated data or large run artifacts.
-- The tracked code is intentionally script-oriented: each module can be run on its own, but the orchestrator is the cleanest end-to-end entry point.
 
